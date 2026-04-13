@@ -13,6 +13,7 @@ Usage:
     python -m evaluation.merchant_reliability.run_eval search
     python -m evaluation.merchant_reliability.run_eval search --limit 3
     python -m evaluation.merchant_reliability.run_eval search --json-only
+    python -m evaluation.merchant_reliability.run_eval search --sleep 2 --per-query-timeout 45
     python -m evaluation.merchant_reliability.run_eval search --no-mre
 """
 
@@ -146,8 +147,8 @@ async def _run_ebay_query(
     prev_mre = os.environ.get("MERCHANT_RELIABILITY_ENABLED")
     os.environ["MERCHANT_RELIABILITY_ENABLED"] = "1" if mre_enabled else "0"
 
+    t0 = time.perf_counter()
     try:
-        t0 = time.perf_counter()
         response = await search_ebay(
             q=q,
             max_price=max_price,
@@ -185,7 +186,7 @@ async def _run_ebay_query(
             risk_flags_seen=list(set(all_flags)),
             passed=results_count >= expect_min,
         )
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         latency_ms = (time.perf_counter() - t0) * 1000
         return SearchEvalResult(
             query_id=qid,
@@ -195,7 +196,7 @@ async def _run_ebay_query(
             results=[],
             search_url="",
             latency_ms=round(latency_ms, 2),
-            error=str(exc),
+            error=str(exc) or type(exc).__name__,
             passed=expect_min == 0,
         )
     finally:
@@ -213,6 +214,8 @@ async def run_search_eval(
     verbose: bool = True,
     mre_enabled: bool = True,
     limit: Optional[int] = None,
+    sleep_seconds: float = 0.0,
+    per_query_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run live search evaluation across all queries."""
     with open(queries_path) as f:
@@ -227,6 +230,10 @@ async def run_search_eval(
 
     if verbose:
         print(f"Running {total} search queries...", flush=True)
+        if sleep_seconds > 0:
+            print(f"  Pace: {sleep_seconds}s sleep between queries (rate-limit friendly).", flush=True)
+        if per_query_timeout and per_query_timeout > 0:
+            print(f"  Per-query timeout: {per_query_timeout}s (prevents hanging).", flush=True)
         print("-" * 120, flush=True)
         hdr = (
             f"{'#':>3}  {'id':<6}  {'query':<35}  {'src':<8}  "
@@ -246,7 +253,27 @@ async def run_search_eval(
                 error=f"Unsupported source: {source}", passed=False,
             )
         else:
-            r = await handler(q_spec, mre_enabled)
+            if per_query_timeout and per_query_timeout > 0:
+                try:
+                    r = await asyncio.wait_for(
+                        handler(q_spec, mre_enabled),
+                        timeout=per_query_timeout,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    exp = q_spec.get("expect_min_results", 1)
+                    r = SearchEvalResult(
+                        query_id=q_spec["id"],
+                        query=q_spec["query"],
+                        source_requested=source,
+                        source_used="error",
+                        results=[],
+                        search_url="",
+                        latency_ms=round(per_query_timeout * 1000, 2),
+                        error=f"Timed out after {per_query_timeout}s",
+                        passed=exp == 0,
+                    )
+            else:
+                r = await handler(q_spec, mre_enabled)
 
         eval_results.append(r)
 
@@ -286,6 +313,9 @@ async def run_search_eval(
             )
             print(line, flush=True)
 
+        if sleep_seconds > 0 and idx < total:
+            await asyncio.sleep(sleep_seconds)
+
     if verbose:
         print("-" * 120, flush=True)
         print(flush=True)
@@ -305,6 +335,64 @@ async def run_search_eval(
     error_count = sum(1 for r in eval_results if r.error)
     total_results = sum(r.results_count for r in eval_results)
 
+    diagnosis: List[str] = []
+    if total > 0:
+        uo = source_counts.get("url_only", 0)
+        api_n = source_counts.get("api", 0)
+        browse_n = source_counts.get("browse", 0)
+        rss_n = source_counts.get("rss", 0)
+        has_app_id = bool(os.getenv("EBAY_APP_ID"))
+        has_browse_oauth = bool(
+            os.getenv("EBAY_OAUTH_CLIENT_ID") and os.getenv("EBAY_OAUTH_CLIENT_SECRET")
+        )
+        if uo == total:
+            if has_app_id:
+                diagnosis.append(
+                    "All queries ended with source=url_only despite EBAY_APP_ID being set. "
+                    "Typical cause: Finding API HTTP 500 + error 10001 (daily/call rate limit on findItemsByKeywords). "
+                    "Check logs for ebay_finding_api_error / ebay_finding_http_error. "
+                    "Fix: set EBAY_OAUTH_CLIENT_ID + EBAY_OAUTH_CLIENT_SECRET so Browse API keyword search can run "
+                    "after Finding fails; or wait for Finding quota to reset. RSS may also time out (ebay_rss_error)."
+                )
+            else:
+                diagnosis.append(
+                    "All queries ended with source=url_only: no parsed listings. "
+                    "Set EBAY_APP_ID for Finding API and/or Browse OAuth for Browse search fallback."
+                )
+        elif api_n == 0 and browse_n == 0 and rss_n == 0 and uo > 0:
+            diagnosis.append(
+                f"{uo}/{total} queries fell back to url_only. "
+                "Finding may be rate-limited (10001); RSS may time out. "
+                "With Browse OAuth configured, Browse search runs automatically between Finding and RSS."
+            )
+        elif browse_n > 0 and api_n == 0:
+            diagnosis.append(
+                f"{browse_n}/{total} query(s) used Browse API search (Finding returned no items or was rate-limited). "
+                "Expected when Finding quota is exhausted but Browse OAuth is valid."
+            )
+        if not has_app_id:
+            diagnosis.append(
+                "EBAY_APP_ID is unset: Finding API is skipped; Browse search still works if OAuth credentials are set."
+            )
+        if uo > 0 and has_app_id and not has_browse_oauth:
+            diagnosis.append(
+                "Browse OAuth not configured: when Finding is rate-limited you only get RSS/url_only. "
+                "Add EBAY_OAUTH_CLIENT_ID (same as App ID) and EBAY_OAUTH_CLIENT_SECRET (Cert ID)."
+            )
+        if mre_enabled and total_results > 0:
+            sr = sum(r.sellers_found for r in eval_results)
+            if sr == 0:
+                diagnosis.append(
+                    "Results returned but sellers_found=0: MRE reports need sellerInfo (Finding) or Browse; "
+                    "RSS rows usually have no seller block."
+                )
+        if error_count:
+            diagnosis.append(f"{error_count} query(s) raised errors; see per_query error fields in artifacts.")
+    if sleep_seconds > 0:
+        diagnosis.append(f"Pacing used: {sleep_seconds}s between queries.")
+    if per_query_timeout and per_query_timeout > 0:
+        diagnosis.append(f"Per-query timeout cap: {per_query_timeout}s.")
+
     summary = {
         "timestamp": datetime.now().isoformat(),
         "queries_run": total,
@@ -319,6 +407,9 @@ async def run_search_eval(
         "latency_p50_ms": round(_pct(latencies, 0.50), 1),
         "latency_p95_ms": round(_pct(latencies, 0.95), 1),
         "mre_enabled": mre_enabled,
+        "sleep_seconds_between_queries": sleep_seconds,
+        "per_query_timeout_seconds": per_query_timeout,
+        "diagnosis": diagnosis,
     }
 
     per_query = []
@@ -342,8 +433,14 @@ def _print_search_summary(summary: Dict[str, Any]):
 
     print("=" * 60, flush=True)
     print(f"  Queries run:         {summary['queries_run']}", flush=True)
-    _src_labels = {"api": "Finding API", "rss": "RSS fallback", "url_only": "URL only", "error": "Errors"}
-    for src in ("api", "rss", "url_only", "error"):
+    _src_labels = {
+        "api": "Finding API",
+        "browse": "Browse search",
+        "rss": "RSS fallback",
+        "url_only": "URL only",
+        "error": "Errors",
+    }
+    for src in ("api", "browse", "rss", "url_only", "error"):
         if sd.get(src, 0) > 0:
             print(f"    {_src_labels.get(src, src):<16} {sd[src]:>4}", flush=True)
     for src in sd:
@@ -361,6 +458,12 @@ def _print_search_summary(summary: Dict[str, Any]):
     print(f"  Latency p50:         {summary['latency_p50_ms']:.0f} ms", flush=True)
     print(f"  Latency p95:         {summary['latency_p95_ms']:.0f} ms", flush=True)
     print(f"  MRE enabled:         {summary['mre_enabled']}", flush=True)
+    dx = summary.get("diagnosis") or []
+    if dx:
+        print(flush=True)
+        print("  Diagnosis:", flush=True)
+        for line in dx:
+            print(f"    - {line}", flush=True)
     print("=" * 60, flush=True)
 
 
@@ -521,6 +624,20 @@ def main():
                           help="Disable MRE scoring (search only, no merchant reports)")
     p_search.add_argument("--mre", action="store_true", default=True,
                           help="Enable MRE scoring (default)")
+    p_search.add_argument(
+        "--sleep",
+        type=float,
+        default=2.0,
+        metavar="SEC",
+        help="Seconds to sleep between queries (default: 2). Use 0 to disable.",
+    )
+    p_search.add_argument(
+        "--per-query-timeout",
+        type=float,
+        default=45.0,
+        metavar="SEC",
+        help="Max seconds per query including HTTP (default: 45). Use 0 to disable.",
+    )
 
     args = parser.parse_args()
 
@@ -585,11 +702,16 @@ def _cmd_search(args):
     if verbose:
         _print_banner()
 
+    sleep_sec = max(0.0, args.sleep)
+    pq_timeout = args.per_query_timeout if args.per_query_timeout and args.per_query_timeout > 0 else None
+
     data = asyncio.run(run_search_eval(
         queries_path=queries_path,
         verbose=verbose,
         mre_enabled=mre_enabled,
         limit=args.limit,
+        sleep_seconds=sleep_sec,
+        per_query_timeout=pq_timeout,
     ))
 
     if args.json_only:

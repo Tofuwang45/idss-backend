@@ -754,8 +754,8 @@ class TestFeatureFlags:
         with patch.dict(os.environ, {"MERCHANT_RELIABILITY_ENABLED": "0"}):
             assert is_mre_enabled() is False
 
-    def test_mre_defaults_to_disabled(self):
+    def test_mre_defaults_to_enabled(self):
         env = {k: v for k, v in os.environ.items()
                if k != "MERCHANT_RELIABILITY_ENABLED"}
         with patch.dict(os.environ, env, clear=True):
-            assert is_mre_enabled() is False
+            assert is_mre_enabled() is True

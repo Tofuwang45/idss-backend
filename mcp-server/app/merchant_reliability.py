@@ -10,7 +10,7 @@ Browse API enrichment data.  Tier assignment follows strict precedence:
   4. LOW         — everything else (including unknowns)
 
 Feature flags:
-  MERCHANT_RELIABILITY_ENABLED  — master on/off (default 0)
+  MERCHANT_RELIABILITY_ENABLED  — master on/off (default on; set to 0 to disable)
   MERCHANT_LLM_SENTIMENT        — enable LLM sentiment layer (default 0)
 """
 
@@ -25,7 +25,7 @@ logger = logging.getLogger("mcp.merchant_reliability")
 # ── Feature flags ─────────────────────────────────────────────────────────────
 
 def is_mre_enabled() -> bool:
-    return os.getenv("MERCHANT_RELIABILITY_ENABLED", "0") == "1"
+    return os.getenv("MERCHANT_RELIABILITY_ENABLED", "1") == "1"
 
 
 def is_llm_sentiment_enabled() -> bool:

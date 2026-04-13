@@ -631,7 +631,7 @@ class EbaySearchResponse(BaseModel):
     max_price: Optional[float] = None
     results: List[EbayResult]
     search_url: str
-    source: str  # "api" | "rss" | "url_only"
+    source: str  # "api" | "browse" | "rss" | "url_only"
 
 
 async def _enrich_results_with_mre(results: List[EbayResult]) -> List[EbayResult]:
@@ -654,21 +654,50 @@ async def _enrich_results_with_mre(results: List[EbayResult]) -> List[EbayResult
 
     enriched = []
     for r in results:
+        browse = browse_profiles.get(r.item_id) if r.item_id else None
+
+        seller_username = None
+        feedback_score = None
+        positive_feedback_pct = None
+        top_rated = None
+        feedback_rating_star = None
+        account_type = None
+        has_return_policy = None
+
         if r.seller and r.seller.seller_username:
-            browse = browse_profiles.get(r.item_id) if r.item_id else None
+            seller_username = r.seller.seller_username
+            feedback_score = r.seller.feedback_score
+            positive_feedback_pct = r.seller.positive_feedback_pct
+            top_rated = r.seller.top_rated_seller
+            feedback_rating_star = r.seller.feedback_rating_star
+
+        if browse:
+            seller_username = seller_username or browse.username or None
+            feedback_score = feedback_score if feedback_score is not None else browse.feedback_score
+            positive_feedback_pct = positive_feedback_pct if positive_feedback_pct is not None else browse.feedback_percentage
+            account_type = browse.seller_account_type
+            has_return_policy = browse.has_return_policy
+            if not r.seller and browse.username:
+                r.seller = EbaySellerInfo(
+                    seller_username=browse.username,
+                    feedback_score=browse.feedback_score,
+                    positive_feedback_pct=browse.feedback_percentage,
+                )
+
+        if seller_username:
             try:
                 price_float = float(r.price.replace("$", "").replace(",", "")) if r.price else None
             except (ValueError, AttributeError):
                 price_float = None
 
             report = await compute_merchant_report(
-                seller_username=r.seller.seller_username,
-                feedback_score=r.seller.feedback_score,
-                positive_feedback_pct=r.seller.positive_feedback_pct,
-                top_rated=r.seller.top_rated_seller,
-                feedback_rating_star=r.seller.feedback_rating_star,
-                account_type=browse.seller_account_type if browse else None,
-                has_return_policy=browse.has_return_policy if browse else None,
+                seller_username=seller_username,
+                feedback_score=feedback_score,
+                positive_feedback_pct=positive_feedback_pct,
+                top_rated=top_rated,
+                feedback_rating_star=feedback_rating_star,
+                account_type=account_type,
+                has_return_policy=has_return_policy,
                 price_usd=price_float,
             )
             r.merchant_report = report.model_dump()
@@ -679,6 +708,38 @@ async def _enrich_results_with_mre(results: List[EbayResult]) -> List[EbayResult
         if x.merchant_report else None
     ))
     return enriched
+
+
+def _ebay_finding_scalar(val: Any) -> Any:
+    if isinstance(val, list) and val:
+        return val[0]
+    return val
+
+
+def _ebay_finding_error_messages(data: Any) -> List[str]:
+    """Extract human-readable errors from eBay Finding API JSON (HTTP 200 or 500)."""
+    if not isinstance(data, dict):
+        return []
+    out: List[str] = []
+    for block in data.get("errorMessage") or []:
+        if not isinstance(block, dict):
+            continue
+        for err in block.get("error") or []:
+            if not isinstance(err, dict):
+                continue
+            eid = _ebay_finding_scalar(err.get("errorId"))
+            sev = _ebay_finding_scalar(err.get("severity"))
+            sub = _ebay_finding_scalar(err.get("subdomain"))
+            msg = _ebay_finding_scalar(err.get("message"))
+            if msg:
+                out.append(f"errorId={eid} severity={sev} subdomain={sub}: {msg}")
+    for resp_blk in data.get("findItemsByKeywordsResponse") or []:
+        if not isinstance(resp_blk, dict):
+            continue
+        ack = _ebay_finding_scalar(resp_blk.get("ack"))
+        if isinstance(ack, str) and ack.upper() == "FAILURE":
+            out.append("findItemsByKeywordsResponse ack=Failure")
+    return out
 
 
 @app.get("/search/ebay", response_model=EbaySearchResponse)
@@ -693,9 +754,10 @@ async def search_ebay(
     Search eBay listings and return structured results.
 
     Priority:
-      1. eBay Finding API (if EBAY_APP_ID env var is set) — authoritative, fast
-      2. eBay RSS feed fallback — no API key needed, parses XML
-      3. URL-only — just returns the search URL so OpenClaw can browse it
+      1. eBay Finding API (if EBAY_APP_ID is set) — fast when quota allows
+      2. Browse API item_summary/search (if OAuth is set) — separate quota; used when Finding returns no items (e.g. rate limit 10001)
+      3. eBay RSS feed — fragile; often HTML or slow
+      4. URL-only — search link only (OpenClaw can open in browser)
 
     Used by the OpenClaw IDSS skill for cross-referencing AI picks against
     live eBay prices and making purchase decisions.
@@ -743,17 +805,63 @@ async def search_ebay(
                 api_params["itemFilter(1).name"] = "Condition"
                 api_params["itemFilter(1).value"] = "3000"
 
+            _ebay_env = os.getenv("EBAY_ENVIRONMENT", "SANDBOX").upper()
+            _finding_host = (
+                "svcs.sandbox.ebay.com" if _ebay_env == "SANDBOX"
+                else "svcs.ebay.com"
+            )
             async with _httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.get(
-                    "https://svcs.ebay.com/services/search/FindingService/v1",
+                    f"https://{_finding_host}/services/search/FindingService/v1",
                     params=api_params,
                 )
-            data = resp.json()
+
+            if resp.status_code != 200:
+                _snip = (resp.text or "")[:700].replace("\n", " ")
+                logger.warning(
+                    "ebay_finding_http_error: status=%s host=%s query=%r snippet=%s",
+                    resp.status_code,
+                    _finding_host,
+                    q[:120],
+                    _snip,
+                )
+
+            try:
+                data = resp.json()
+            except Exception as _json_e:
+                logger.warning(
+                    "ebay_finding_json_error: host=%s query=%r err=%s text_snippet=%s",
+                    _finding_host,
+                    q[:120],
+                    _json_e,
+                    (resp.text or "")[:400].replace("\n", " "),
+                )
+                raise
+
+            _finding_errs = _ebay_finding_error_messages(data)
+            for _fe in _finding_errs:
+                logger.warning("ebay_finding_api_error: %s", _fe)
+
             items = (
                 data.get("findItemsByKeywordsResponse", [{}])[0]
                 .get("searchResult", [{}])[0]
                 .get("item", [])
             )
+            if not items:
+                if _finding_errs or resp.status_code != 200:
+                    logger.warning(
+                        "ebay_finding_no_items: host=%s query=%r http_status=%s "
+                        "(see ebay_finding_* logs above; often rate limit 10001 or auth)",
+                        _finding_host,
+                        q[:120],
+                        resp.status_code,
+                    )
+                else:
+                    logger.info(
+                        "ebay_finding_zero_items: host=%s query=%r (success, no matching listings)",
+                        _finding_host,
+                        q[:120],
+                    )
             results = []
             for item in items[:limit]:
                 vcs = item.get("viewItemURL", [""])
@@ -796,13 +904,65 @@ async def search_ebay(
         except Exception as _e:
             logger.warning("ebay_api_error: %s", _e)
 
+    # ── Attempt 1b: Browse API keyword search (OAuth; not throttled with Finding) ─
+    try:
+        from app.ebay_seller import is_browse_configured, search_item_summaries
+        if is_browse_configured():
+            browse_rows = await search_item_summaries(
+                q=q,
+                limit=limit,
+                max_price=max_price,
+                condition=condition,
+                sort=sort,
+            )
+            if browse_rows:
+                br_results: List[EbayResult] = []
+                for row in browse_rows:
+                    es = None
+                    if row.get("seller_username"):
+                        tr = row.get("top_rated_seller")
+                        if isinstance(tr, str):
+                            tr = tr.strip().lower() in ("true", "1", "yes")
+                        elif tr is not None and not isinstance(tr, bool):
+                            tr = bool(tr)
+                        es = EbaySellerInfo(
+                            seller_username=row.get("seller_username"),
+                            feedback_score=row.get("feedback_score"),
+                            positive_feedback_pct=row.get("positive_feedback_pct"),
+                            top_rated_seller=tr,
+                        )
+                    u = row.get("url") or search_url
+                    br_results.append(EbayResult(
+                        title=row.get("title") or "",
+                        price=row.get("price"),
+                        condition=row.get("condition"),
+                        url=u,
+                        shipping=row.get("shipping"),
+                        item_id=row.get("item_id"),
+                        seller=es,
+                    ))
+                br_results = await _enrich_results_with_mre(br_results)
+                return EbaySearchResponse(
+                    query=q, max_price=max_price, results=br_results,
+                    search_url=search_url, source="browse",
+                )
+    except Exception as _e:
+        logger.warning("ebay_browse_search_error: %s", _e)
+
     # ── Attempt 2: eBay RSS feed (no auth needed) ────────────────────────────
     try:
         rss_url = search_url + "&_rss=1"
-        async with _httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers={
+        async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers={
             "User-Agent": "Mozilla/5.0 (compatible; IDSS-Shopping/1.0)"
         }) as client:
             rss_resp = await client.get(rss_url)
+
+        if rss_resp.status_code != 200:
+            logger.warning(
+                "ebay_rss_http_error: status=%s snippet=%s",
+                rss_resp.status_code,
+                (rss_resp.text or "")[:500].replace("\n", " "),
+            )
 
         root = _ET.fromstring(rss_resp.text)
         ns = {"media": "http://search.yahoo.com/mrss/"}
@@ -834,8 +994,22 @@ async def search_ebay(
             results = await _enrich_results_with_mre(results)
             return EbaySearchResponse(query=q, max_price=max_price, results=results,
                                       search_url=search_url, source="rss")
+    except asyncio.CancelledError:
+        # Genuine task cancellation (eval timeout, shutdown) must propagate.
+        # Spurious CancelledError during httpx RSS fetch has been seen on Windows;
+        # Task.cancelling() is True only when our task is being cancelled.
+        _ct = asyncio.current_task()
+        if _ct is not None and getattr(_ct, "cancelling", lambda: False)():
+            raise
+        logger.warning(
+            "ebay_rss_cancelled_soft: query=%r (RSS aborted without task cancel; url_only fallback)",
+            q[:120],
+        )
     except Exception as _e:
-        logger.warning("ebay_rss_error: %s", _e)
+        logger.warning(
+            "ebay_rss_error: %s",
+            _e if str(_e) else f"{type(_e).__name__} (non-empty message often missing for XML parse errors)",
+        )
 
     # ── Attempt 3: URL-only fallback ─────────────────────────────────────────
     # OpenClaw's browser automation will open the URL and scrape the page itself.

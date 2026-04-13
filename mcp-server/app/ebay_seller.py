@@ -15,7 +15,7 @@ import time
 import asyncio
 import logging
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -42,6 +42,11 @@ def _get_env() -> str:
 def _urls() -> Dict[str, str]:
     env = _get_env()
     return _EBAY_URLS.get(env, _EBAY_URLS["SANDBOX"])
+
+
+def _browse_api_root() -> str:
+    """REST root for Buy APIs (Browse search, item detail)."""
+    return "https://api.sandbox.ebay.com" if _get_env() == "SANDBOX" else "https://api.ebay.com"
 
 
 def is_browse_configured() -> bool:
@@ -94,11 +99,12 @@ async def _request_with_backoff(
     url: str,
     headers: Dict[str, str],
     max_retries: int = 3,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Optional[httpx.Response]:
     """GET with exponential backoff on transient failures."""
     for attempt in range(max_retries):
         try:
-            resp = await client.get(url, headers=headers)
+            resp = await client.get(url, headers=headers, params=params)
             if resp.status_code == 429:
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 logger.info("ebay_browse_rate_limit: retry in %.1fs", wait)
@@ -111,7 +117,187 @@ async def _request_with_backoff(
                 return None
             wait = (2 ** attempt) + random.uniform(0, 1)
             await asyncio.sleep(wait)
-    return None
+        return None
+
+
+def _item_summary_listing_url(item: Dict[str, Any]) -> str:
+    """Buyer-facing URL for an item summary row."""
+    web = item.get("itemWebUrl")
+    if isinstance(web, str) and web.startswith("http"):
+        return web
+    iid = item.get("itemId")
+    if isinstance(iid, str) and "|" in iid:
+        parts = iid.split("|")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return f"https://www.ebay.com/itm/{parts[1]}"
+    href = item.get("itemHref")
+    return href if isinstance(href, str) else ""
+
+
+def _rows_from_item_summaries(summaries: List[Any], lim: int) -> List[Dict[str, Any]]:
+    """Map Browse API itemSummaries to row dicts for EbayResult construction."""
+    rows: List[Dict[str, Any]] = []
+    for item in summaries[:lim]:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title") or ""
+        price_block = item.get("price") or {}
+        pval = price_block.get("value")
+        price_str = None
+        if pval is not None:
+            try:
+                price_str = f"${float(pval):,.2f}"
+            except (TypeError, ValueError):
+                price_str = str(pval)
+
+        ship_label = None
+        for opt in item.get("shippingOptions") or []:
+            if not isinstance(opt, dict):
+                continue
+            if opt.get("shippingCostType") == "FREE":
+                ship_label = "Free"
+                break
+            sc = opt.get("shippingCost") or {}
+            if str(sc.get("value", "")) in ("0", "0.00", "0.0"):
+                ship_label = "Free"
+                break
+
+        seller = item.get("seller") or {}
+        uname = seller.get("username") if isinstance(seller, dict) else None
+        fb_pct = None
+        fb_raw = seller.get("feedbackPercentage") if isinstance(seller, dict) else None
+        if fb_raw is not None:
+            try:
+                fb_pct = float(fb_raw)
+            except (TypeError, ValueError):
+                pass
+        fb_score = None
+        fs_raw = seller.get("feedbackScore") if isinstance(seller, dict) else None
+        if fs_raw is not None:
+            try:
+                fb_score = int(fs_raw)
+            except (TypeError, ValueError):
+                pass
+
+        iid = item.get("itemId")
+        rows.append({
+            "title": title,
+            "price": price_str,
+            "condition": item.get("condition"),
+            "url": _item_summary_listing_url(item),
+            "shipping": ship_label,
+            "item_id": str(iid) if iid else None,
+            "seller_username": uname if uname else None,
+            "feedback_score": fb_score,
+            "positive_feedback_pct": fb_pct,
+            "top_rated_seller": item.get("topRatedBuyingExperience"),
+        })
+    return rows
+
+
+async def search_item_summaries(
+    q: str,
+    limit: int = 10,
+    max_price: Optional[float] = None,
+    condition: Optional[str] = None,
+    sort: Optional[str] = "best-match",
+) -> List[Dict[str, Any]]:
+    """
+    Keyword search via Browse API GET /buy/browse/v1/item_summary/search.
+
+    Uses OAuth application token (same as item detail). Separate quota from
+    the legacy Finding API — useful when Finding returns error 10001 rate limits.
+    """
+    if not is_browse_configured():
+        return []
+
+    token = await get_application_access_token()
+    if not token:
+        return []
+
+    root = _browse_api_root()
+    url = f"{root}/buy/browse/v1/item_summary/search"
+    lim = min(max(int(limit), 1), 200)
+    params: Dict[str, Any] = {
+        "q": (q or "")[:100],
+        "limit": str(lim),
+    }
+    if sort == "price-low":
+        params["sort"] = "price"
+
+    filter_parts: List[str] = []
+    if max_price is not None:
+        filter_parts.append(f"price:[0..{int(max_price)}]")
+        filter_parts.append("priceCurrency:USD")
+    if condition == "new":
+        filter_parts.append("conditions:{NEW}")
+    elif condition == "used":
+        filter_parts.append("conditions:{USED}")
+    if filter_parts:
+        params["filter"] = ",".join(filter_parts)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        "Accept": "application/json",
+    }
+
+    async def _do_search(
+        client: httpx.AsyncClient,
+        req_params: Dict[str, Any],
+    ) -> tuple[Optional[httpx.Response], Optional[Dict[str, Any]]]:
+        r = await _request_with_backoff(client, url, headers, params=req_params)
+        if r is None or r.status_code != 200:
+            return r, None
+        try:
+            return r, r.json()
+        except Exception as exc:
+            logger.warning("ebay_browse_search_json: %s", exc)
+            return r, None
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp, payload = await _do_search(client, params)
+        if resp is None:
+            logger.warning("ebay_browse_search_failed: no response for query=%r", (q or "")[:80])
+            return []
+        if resp.status_code != 200:
+            logger.warning(
+                "ebay_browse_search_http: status=%s query=%r snippet=%s",
+                resp.status_code,
+                (q or "")[:80],
+                (resp.text or "")[:500].replace("\n", " "),
+            )
+            return []
+        if payload is None:
+            return []
+
+        summaries = payload.get("itemSummaries") or []
+        if not summaries and filter_parts:
+            logger.warning(
+                "ebay_browse_search_retry_loose: query=%r strict filters returned no items; retrying keyword-only",
+                (q or "")[:80],
+            )
+            loose: Dict[str, Any] = {
+                "q": (q or "")[:100],
+                "limit": str(lim),
+            }
+            if sort == "price-low":
+                loose["sort"] = "price"
+            resp2, payload2 = await _do_search(client, loose)
+            if resp2 is not None and resp2.status_code == 200 and payload2 is not None:
+                summaries = payload2.get("itemSummaries") or []
+
+        if not summaries:
+            logger.warning(
+                "ebay_browse_search_zero_items: query=%r total_field=%r",
+                (q or "")[:80],
+                (payload.get("total", "0") if payload else "0"),
+            )
+            return []
+
+    rows = _rows_from_item_summaries(summaries, lim)
+    logger.info("ebay_browse_search_ok: query=%r rows=%d", (q or "")[:80], len(rows))
+    return rows
 
 
 class BrowseSellerProfile:
@@ -158,7 +344,8 @@ async def get_item_seller_profile(item_id: str) -> Optional[BrowseSellerProfile]
         return None
 
     browse_base = _urls()["browse"]
-    url = f"{browse_base}/v1|{item_id}"
+    browse_item_id = item_id if "|" in item_id else f"v1|{item_id}|0"
+    url = f"{browse_base}/{browse_item_id}"
     headers = {
         "Authorization": f"Bearer {token}",
         "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
