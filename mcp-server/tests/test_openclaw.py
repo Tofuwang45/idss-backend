@@ -279,6 +279,69 @@ class TestSearchEbay:
         assert data["results"][0]["price"] == "$999.99"
         assert data["results"][0]["url"] == "https://www.ebay.com/itm/123456789"
 
+    def test_finding_api_seller_fields_propagated(self):
+        """Finding API results should include seller info and item_id."""
+        finding_json = {
+            "findItemsByKeywordsResponse": [{
+                "searchResult": [{
+                    "item": [{
+                        "itemId": ["110123456789"],
+                        "title": ["Dell XPS 15 9530 Laptop"],
+                        "viewItemURL": ["https://www.ebay.com/itm/110123456789"],
+                        "sellingStatus": [{"currentPrice": [{"@currencyId": "USD", "__value__": "1099.00"}]}],
+                        "condition": [{"conditionDisplayName": ["New"]}],
+                        "shippingInfo": [{"shippingType": ["Free"]}],
+                        "sellerInfo": [{
+                            "sellerUserName": ["tech_deals_usa"],
+                            "feedbackScore": ["14520"],
+                            "positiveFeedbackPercent": ["99.4"],
+                            "feedbackRatingStar": ["YellowShooting"],
+                            "topRatedSeller": ["true"]
+                        }]
+                    }]
+                }]
+            }]
+        }
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = finding_json
+        mock_resp.status_code = 200
+        with patch.dict(os.environ, {"EBAY_APP_ID": "test-app-id"}):
+            with patch("httpx.AsyncClient") as mock_cls:
+                mock_cls.return_value.__aenter__.return_value.get.return_value = mock_resp
+                with patch("app.main._enrich_results_with_mre", new_callable=AsyncMock, side_effect=lambda r: r):
+                    resp = self.client.get("/search/ebay", params={"q": "dell xps"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source"] == "api"
+        assert len(data["results"]) == 1
+        r = data["results"][0]
+        assert r["item_id"] == "110123456789"
+        assert r["seller"]["seller_username"] == "tech_deals_usa"
+        assert r["seller"]["feedback_score"] == 14520
+        assert r["seller"]["positive_feedback_pct"] == 99.4
+        assert r["seller"]["top_rated_seller"] is True
+
+    def test_rss_item_id_extracted_from_link(self):
+        """RSS results should extract item_id from the link URL."""
+        rss_xml = (
+            '<?xml version="1.0"?><rss><channel>'
+            '<item>'
+            '<title>ThinkPad X1 Carbon</title>'
+            '<link>https://www.ebay.com/itm/220987654321</link>'
+            '<description>$899.99 free shipping</description>'
+            '</item>'
+            '</channel></rss>'
+        )
+        mock_resp = MagicMock()
+        mock_resp.text = rss_xml
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__.return_value.get.return_value = mock_resp
+            with patch("app.main._enrich_results_with_mre", new_callable=AsyncMock, side_effect=lambda r: r):
+                resp = self.client.get("/search/ebay", params={"q": "thinkpad"})
+        data = resp.json()
+        assert data["source"] == "rss"
+        assert data["results"][0]["item_id"] == "220987654321"
+
     def test_rss_result_without_price_has_none_price(self):
         rss_xml = (
             '<?xml version="1.0"?><rss><channel>'

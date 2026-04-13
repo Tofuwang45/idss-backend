@@ -140,6 +140,15 @@ export default {
             reply += `\n${i + 1}. ${item.title}`;
             if (item.price)     reply += ` — ${item.price}`;
             if (item.condition) reply += ` (${item.condition})`;
+            if (item.seller) {
+              const s = item.seller;
+              const pct = s.positive_feedback_pct != null ? `${s.positive_feedback_pct}% positive` : '';
+              const top = s.top_rated_seller ? ', Top Rated' : '';
+              if (pct) reply += `\n   Seller: ${s.seller_username || 'unknown'} (${pct}${top})`;
+            }
+            if (item.merchant_report) {
+              reply += `\n   Trust: ${item.merchant_report.reliability_tier}`;
+            }
             if (item.shipping)  reply += `\n   📦 ${item.shipping}`;
             reply += `\n   ${item.url}`;
           });

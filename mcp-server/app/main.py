@@ -606,12 +606,24 @@ async def openclaw_message(request: Request):
 
 # ─── eBay deal search ─────────────────────────────────────────────────────────
 
+class EbaySellerInfo(BaseModel):
+    """Seller fields extracted from eBay Finding API sellerInfo block."""
+    seller_username: Optional[str] = None
+    feedback_score: Optional[int] = None
+    positive_feedback_pct: Optional[float] = None
+    feedback_rating_star: Optional[str] = None
+    top_rated_seller: Optional[bool] = None
+
+
 class EbayResult(BaseModel):
     title: str
     price: Optional[str] = None
     condition: Optional[str] = None
     url: str
     shipping: Optional[str] = None
+    item_id: Optional[str] = None
+    seller: Optional[EbaySellerInfo] = None
+    merchant_report: Optional[Dict[str, Any]] = None
 
 
 class EbaySearchResponse(BaseModel):
@@ -620,6 +632,53 @@ class EbaySearchResponse(BaseModel):
     results: List[EbayResult]
     search_url: str
     source: str  # "api" | "rss" | "url_only"
+
+
+async def _enrich_results_with_mre(results: List[EbayResult]) -> List[EbayResult]:
+    """Attach MerchantReport to each result and sort by trust tier."""
+    from app.merchant_reliability import (
+        is_mre_enabled, compute_merchant_report, tier_sort_key,
+    )
+    from app.ebay_seller import enrich_items_with_browse, is_browse_configured
+
+    if not is_mre_enabled() or not results:
+        return results
+
+    browse_profiles = {}
+    if is_browse_configured():
+        item_ids = [r.item_id for r in results if r.item_id]
+        try:
+            browse_profiles = await enrich_items_with_browse(item_ids, concurrency=3)
+        except Exception as _e:
+            logger.warning("mre_browse_enrich_error: %s", _e)
+
+    enriched = []
+    for r in results:
+        if r.seller and r.seller.seller_username:
+            browse = browse_profiles.get(r.item_id) if r.item_id else None
+            try:
+                price_float = float(r.price.replace("$", "").replace(",", "")) if r.price else None
+            except (ValueError, AttributeError):
+                price_float = None
+
+            report = await compute_merchant_report(
+                seller_username=r.seller.seller_username,
+                feedback_score=r.seller.feedback_score,
+                positive_feedback_pct=r.seller.positive_feedback_pct,
+                top_rated=r.seller.top_rated_seller,
+                feedback_rating_star=r.seller.feedback_rating_star,
+                account_type=browse.seller_account_type if browse else None,
+                has_return_policy=browse.has_return_policy if browse else None,
+                price_usd=price_float,
+            )
+            r.merchant_report = report.model_dump()
+        enriched.append(r)
+
+    enriched.sort(key=lambda x: tier_sort_key(
+        type("_R", (), {"reliability_tier": x.merchant_report.get("reliability_tier", "LOW")})()
+        if x.merchant_report else None
+    ))
+    return enriched
 
 
 @app.get("/search/ebay", response_model=EbaySearchResponse)
@@ -702,14 +761,36 @@ async def search_ebay(
                 price_val = price_info.get("__value__", "")
                 cond = item.get("condition", [{}])[0].get("conditionDisplayName", [""])[0]
                 ship = item.get("shippingInfo", [{}])[0].get("shippingType", [""])[0]
+
+                seller_info_raw = item.get("sellerInfo", [{}])[0] if item.get("sellerInfo") else {}
+                seller = None
+                if seller_info_raw:
+                    _fb = seller_info_raw.get("feedbackScore", [None])[0] if isinstance(seller_info_raw.get("feedbackScore"), list) else seller_info_raw.get("feedbackScore")
+                    _pct = seller_info_raw.get("positiveFeedbackPercent", [None])[0] if isinstance(seller_info_raw.get("positiveFeedbackPercent"), list) else seller_info_raw.get("positiveFeedbackPercent")
+                    _top = seller_info_raw.get("topRatedSeller", [None])[0] if isinstance(seller_info_raw.get("topRatedSeller"), list) else seller_info_raw.get("topRatedSeller")
+                    _uname = seller_info_raw.get("sellerUserName", [None])[0] if isinstance(seller_info_raw.get("sellerUserName"), list) else seller_info_raw.get("sellerUserName")
+                    _star = seller_info_raw.get("feedbackRatingStar", [None])[0] if isinstance(seller_info_raw.get("feedbackRatingStar"), list) else seller_info_raw.get("feedbackRatingStar")
+                    seller = EbaySellerInfo(
+                        seller_username=_uname or None,
+                        feedback_score=int(_fb) if _fb is not None else None,
+                        positive_feedback_pct=float(_pct) if _pct is not None else None,
+                        feedback_rating_star=_star or None,
+                        top_rated_seller=str(_top).lower() == "true" if _top is not None else None,
+                    )
+
+                _item_id_raw = item.get("itemId", [None])[0] if isinstance(item.get("itemId"), list) else item.get("itemId")
+
                 results.append(EbayResult(
                     title=item.get("title", [""])[0],
                     price=f"${float(price_val):,.2f}" if price_val else None,
                     condition=cond or None,
                     url=vcs[0] if vcs else search_url,
                     shipping=ship or None,
+                    item_id=str(_item_id_raw) if _item_id_raw else None,
+                    seller=seller if seller and seller.seller_username else None,
                 ))
             if results:
+                results = await _enrich_results_with_mre(results)
                 return EbaySearchResponse(query=q, max_price=max_price, results=results,
                                           search_url=search_url, source="api")
         except Exception as _e:
@@ -744,9 +825,13 @@ async def search_ebay(
             price_match = _re_local.search(r"\$[\d,]+(?:\.\d{2})?", desc_html or "")
             price_str = price_match.group(0) if price_match else None
 
-            results.append(EbayResult(title=title, price=price_str, url=link))
+            _itm_match = _re_local.search(r'/itm/(\d+)', link)
+            _rss_item_id = _itm_match.group(1) if _itm_match else None
+
+            results.append(EbayResult(title=title, price=price_str, url=link, item_id=_rss_item_id))
 
         if results:
+            results = await _enrich_results_with_mre(results)
             return EbaySearchResponse(query=q, max_price=max_price, results=results,
                                       search_url=search_url, source="rss")
     except Exception as _e:

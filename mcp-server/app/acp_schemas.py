@@ -239,6 +239,7 @@ class ACPProductFeedItem(BaseModel):
     brand: Optional[str] = None
     rating: Optional[float] = None
     rating_count: Optional[int] = None
+    seller_reliability: Optional[str] = Field(None, description="MRE trust tier: HIGH | MEDIUM | LOW | DO_NOT_BUY")
 
 
 # ============================================================================

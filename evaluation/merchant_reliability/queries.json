@@ -1,0 +1,137 @@
+[
+  {
+    "id": "q01",
+    "query": "Dell XPS 15 laptop",
+    "max_price": 1500,
+    "condition": "new",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["laptop", "electronics"]
+  },
+  {
+    "id": "q02",
+    "query": "MacBook Pro M3",
+    "max_price": 2500,
+    "condition": null,
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["laptop", "apple"]
+  },
+  {
+    "id": "q03",
+    "query": "used ThinkPad X1 Carbon",
+    "max_price": 800,
+    "condition": "used",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["laptop", "used"]
+  },
+  {
+    "id": "q04",
+    "query": "iPhone 15 Pro Max 256GB",
+    "max_price": 1200,
+    "condition": null,
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["phone", "apple"]
+  },
+  {
+    "id": "q05",
+    "query": "Samsung Galaxy S24 Ultra",
+    "max_price": 1000,
+    "condition": "new",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["phone", "samsung"]
+  },
+  {
+    "id": "q06",
+    "query": "Sony WH-1000XM5 headphones",
+    "max_price": 350,
+    "condition": null,
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["accessories", "audio"]
+  },
+  {
+    "id": "q07",
+    "query": "Nintendo Switch OLED",
+    "max_price": 400,
+    "condition": "new",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["gaming", "console"]
+  },
+  {
+    "id": "q08",
+    "query": "refurbished iPad Air",
+    "max_price": 500,
+    "condition": "refurbished",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["tablet", "refurbished"]
+  },
+  {
+    "id": "q09",
+    "query": "mechanical keyboard RGB",
+    "max_price": 150,
+    "condition": null,
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["accessories", "peripherals"]
+  },
+  {
+    "id": "q10",
+    "query": "NVIDIA RTX 4070 graphics card",
+    "max_price": 700,
+    "condition": "new",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["components", "gpu"]
+  },
+  {
+    "id": "q11",
+    "query": "used Canon EOS R6 camera",
+    "max_price": 1500,
+    "condition": "used",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["camera", "used"]
+  },
+  {
+    "id": "q12",
+    "query": "AirPods Pro 2nd generation",
+    "max_price": 250,
+    "condition": null,
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["accessories", "audio", "apple"]
+  },
+  {
+    "id": "q13",
+    "query": "gaming laptop RTX 4060",
+    "max_price": 1200,
+    "condition": "new",
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["laptop", "gaming"]
+  },
+  {
+    "id": "q14",
+    "query": "USB-C hub docking station",
+    "max_price": 80,
+    "condition": null,
+    "source": "ebay",
+    "expect_min_results": 1,
+    "tags": ["accessories", "peripherals"]
+  },
+  {
+    "id": "q15",
+    "query": "xyznonexistentproduct12345",
+    "max_price": null,
+    "condition": null,
+    "source": "ebay",
+    "expect_min_results": 0,
+    "tags": ["edge_case", "no_results"]
+  }
+]

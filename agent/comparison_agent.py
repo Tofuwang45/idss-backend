@@ -286,6 +286,15 @@ def _build_spec_sheet(products: List[Dict[str, Any]], domain: str) -> str:
         rating = p.get("rating")
         if rating:
             lines.append(f"    Rating: {float(rating):.1f} ★")
+
+        mr = p.get("merchant_report") or (p.get("metadata") or {}).get("merchant_report")
+        if mr and isinstance(mr, dict):
+            tier = mr.get("reliability_tier", "UNKNOWN")
+            ctx = mr.get("negotiation_context", "")
+            lines.append(f"    Seller Trust: {tier}")
+            if ctx:
+                lines.append(f"    Trust Note: {ctx}")
+
         lines.append("")  # blank line between products
 
     return "\n".join(lines)
