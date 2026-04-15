@@ -503,7 +503,7 @@ FINDING_RESPONSE_MULTI = {
                 },
                 {
                     "itemId": ["BBB222"],
-                    "title": ["Dell XPS HIGH seller"],
+                    "title": ["Dell XPS Laptop HIGH seller"],
                     "viewItemURL": ["https://www.ebay.com/itm/BBB222"],
                     "sellingStatus": [{"currentPrice": [{"@currencyId": "USD", "__value__": "1200.00"}]}],
                     "condition": [{"conditionDisplayName": ["New"]}],
@@ -518,7 +518,7 @@ FINDING_RESPONSE_MULTI = {
                 },
                 {
                     "itemId": ["CCC333"],
-                    "title": ["Scam Laptop DNB seller"],
+                    "title": ["Scam Cheap Laptop DNB seller"],
                     "viewItemURL": ["https://www.ebay.com/itm/CCC333"],
                     "sellingStatus": [{"currentPrice": [{"@currencyId": "USD", "__value__": "150.00"}]}],
                     "condition": [{"conditionDisplayName": ["Used"]}],
@@ -533,7 +533,7 @@ FINDING_RESPONSE_MULTI = {
                 },
                 {
                     "itemId": ["DDD444"],
-                    "title": ["ThinkPad MEDIUM seller"],
+                    "title": ["ThinkPad Laptop MEDIUM seller"],
                     "viewItemURL": ["https://www.ebay.com/itm/DDD444"],
                     "sellingStatus": [{"currentPrice": [{"@currencyId": "USD", "__value__": "800.00"}]}],
                     "condition": [{"conditionDisplayName": ["Refurbished"]}],
@@ -611,10 +611,10 @@ class TestSearchEbayWithMRE:
         results = resp.json()["results"]
         by_title = {r["title"]: r for r in results}
 
-        assert by_title["Dell XPS HIGH seller"]["merchant_report"]["reliability_tier"] == "HIGH"
-        assert by_title["ThinkPad MEDIUM seller"]["merchant_report"]["reliability_tier"] == "MEDIUM"
+        assert by_title["Dell XPS Laptop HIGH seller"]["merchant_report"]["reliability_tier"] == "HIGH"
+        assert by_title["ThinkPad Laptop MEDIUM seller"]["merchant_report"]["reliability_tier"] == "MEDIUM"
         assert by_title["Budget Laptop LOW seller"]["merchant_report"]["reliability_tier"] == "LOW"
-        assert by_title["Scam Laptop DNB seller"]["merchant_report"]["reliability_tier"] == "DO_NOT_BUY"
+        assert by_title["Scam Cheap Laptop DNB seller"]["merchant_report"]["reliability_tier"] == "DO_NOT_BUY"
 
     def test_mre_risk_flags_propagated(self):
         mock_resp = MagicMock()
@@ -635,7 +635,7 @@ class TestSearchEbayWithMRE:
         results = resp.json()["results"]
         by_title = {r["title"]: r for r in results}
 
-        dnb = by_title["Scam Laptop DNB seller"]["merchant_report"]
+        dnb = by_title["Scam Cheap Laptop DNB seller"]["merchant_report"]
         assert "LOW_VOLUME" in dnb["risk_flags"]
         assert "NEW_ACCOUNT" in dnb["risk_flags"]
 
@@ -678,7 +678,7 @@ class TestSearchEbayWithMRE:
 
         results = resp.json()["results"]
         by_title = {r["title"]: r for r in results}
-        high = by_title["Dell XPS HIGH seller"]
+        high = by_title["Dell XPS Laptop HIGH seller"]
 
         assert high["seller"]["seller_username"] == "top_electronics_pro"
         assert high["seller"]["feedback_score"] == 24500

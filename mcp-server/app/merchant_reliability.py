@@ -197,6 +197,7 @@ async def compute_merchant_report(
 
     llm_flags = await _llm_sentiment_flags(description_text or "")
     risk_flags.extend(llm_flags)
+    risk_flags = [f for f in risk_flags if f]
 
     tier = _compute_tier(top_rated, positive_feedback_pct, feedback_score, risk_flags)
 

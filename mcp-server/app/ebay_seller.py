@@ -15,11 +15,94 @@ import time
 import asyncio
 import logging
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import re
 
 import httpx
 
 logger = logging.getLogger("mcp.ebay_seller")
+
+
+# ── Relevance filtering ──────────────────────────────────────────────────────
+
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "for", "and", "or", "in", "on", "of", "to", "with",
+    "is", "it", "by", "at", "from", "as", "be", "this", "that", "new", "used",
+})
+
+_RE_NONALPHA = re.compile(r"[^a-z0-9]+")
+
+
+def _tokenize(text: str) -> set[str]:
+    """Lower-case, strip punctuation, remove stop words."""
+    words = _RE_NONALPHA.sub(" ", text.lower()).split()
+    return {w for w in words if w and w not in _STOP_WORDS}
+
+
+_ACCESSORY_INDICATORS = frozenset({
+    "case", "cover", "protector", "screen", "film", "skin", "sleeve",
+    "charger", "cable", "adapter", "stand", "mount", "holder", "strap",
+    "replacement", "repair", "part", "lcd", "digitizer", "battery",
+    "tool", "kit", "tempered", "glass",
+})
+
+
+def relevance_score(query: str, title: str) -> float:
+    """
+    Relevance between search query and item title.
+    Uses query recall + Jaccard, with a penalty if the title contains
+    accessory-indicator tokens that are absent from the query.
+    Returns 0.0–1.0.
+    """
+    q_tokens = _tokenize(query)
+    t_tokens = _tokenize(title)
+    if not q_tokens:
+        return 1.0
+    overlap = q_tokens & t_tokens
+    recall = len(overlap) / len(q_tokens)
+    union = q_tokens | t_tokens
+    jaccard = len(overlap) / len(union) if union else 0.0
+    base = 0.6 * recall + 0.4 * jaccard
+
+    extra = t_tokens - q_tokens
+    accessory_hits = extra & _ACCESSORY_INDICATORS
+    if accessory_hits:
+        penalty = min(len(accessory_hits) * 0.25, 0.5)
+        base *= (1.0 - penalty)
+
+    return base
+
+
+def filter_relevant(
+    rows: List[Dict[str, Any]],
+    query: str,
+    threshold: float = 0.45,
+    title_key: str = "title",
+) -> List[Dict[str, Any]]:
+    """Drop rows whose title has low relevance to the search query."""
+    if not query:
+        return rows
+    return [r for r in rows if relevance_score(query, r.get(title_key, "")) >= threshold]
+
+
+def _canonicalize_comparable_query(query: str) -> str:
+    """
+    Relaxed fallback query for sold-comparable retrieval.
+    Removes noisy modifiers while preserving core brand/model/storage tokens.
+    """
+    tokens = [t for t in _tokenize(query) if t]
+    if not tokens:
+        return query
+    remove = {
+        "mint", "excellent", "bundle", "sealed", "open", "box",
+        "edition", "brand", "new", "used", "refurbished", "latest",
+    }
+    keep = [t for t in tokens if t not in remove and not t.isdigit()]
+    # Keep query usable even if aggressive removal empties token list.
+    if not keep:
+        keep = tokens
+    return " ".join(keep[:8])
 
 _EBAY_URLS = {
     "PRODUCTION": {
@@ -33,6 +116,7 @@ _EBAY_URLS = {
 }
 
 _token_cache: Dict[str, Any] = {"token": None, "expires_at": 0.0}
+_comps_cache: Dict[Tuple[str, Optional[str], Optional[float], int, int], Dict[str, Any]] = {}
 
 
 def _get_env() -> str:
@@ -179,10 +263,18 @@ def _rows_from_item_summaries(summaries: List[Any], lim: int) -> List[Dict[str, 
             except (TypeError, ValueError):
                 pass
 
+        price_cents = None
+        if pval is not None:
+            try:
+                price_cents = round(float(pval) * 100)
+            except (TypeError, ValueError):
+                pass
+
         iid = item.get("itemId")
         rows.append({
             "title": title,
             "price": price_str,
+            "price_cents": price_cents,
             "condition": item.get("condition"),
             "url": _item_summary_listing_url(item),
             "shipping": ship_label,
@@ -296,7 +388,367 @@ async def search_item_summaries(
             return []
 
     rows = _rows_from_item_summaries(summaries, lim)
+    rows = filter_relevant(rows, q)
     logger.info("ebay_browse_search_ok: query=%r rows=%d", (q or "")[:80], len(rows))
+    return rows
+
+
+def _finding_host() -> str:
+    """Return the correct eBay Finding API host for the current environment."""
+    return (
+        "svcs.sandbox.ebay.com" if _get_env() == "SANDBOX"
+        else "svcs.ebay.com"
+    )
+
+
+def _build_comparable_diagnostics(
+    *,
+    stage: str,
+    query_used: str,
+    condition_used: Optional[str],
+    max_price_used: Optional[float],
+) -> Dict[str, Any]:
+    return {
+        "stage": stage,
+        "query_used": query_used,
+        "condition_used": condition_used,
+        "max_price_used": max_price_used,
+        "api_items_raw_count": 0,
+        "sold_state_kept_count": 0,
+        "price_parse_kept_count": 0,
+        "relevance_kept_count": 0,
+        "final_count": 0,
+        "failure_reason": None,
+        "error_id": None,
+        "error_message": None,
+    }
+
+
+def _extract_finding_error(resp: httpx.Response) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort parse of eBay Finding error payload."""
+    try:
+        data = resp.json()
+    except Exception:
+        return None, None
+
+    # eBay Finding often returns:
+    # {"errorMessage":[{"error":[{"errorId":["10001"],"message":[...]}]}]}
+    for block in data.get("errorMessage") or []:
+        if not isinstance(block, dict):
+            continue
+        for err in block.get("error") or []:
+            if not isinstance(err, dict):
+                continue
+            eid = err.get("errorId")
+            if isinstance(eid, list) and eid:
+                eid = str(eid[0])
+            elif eid is not None:
+                eid = str(eid)
+            else:
+                eid = None
+            msg = err.get("message")
+            if isinstance(msg, list) and msg:
+                msg = str(msg[0])
+            elif msg is not None:
+                msg = str(msg)
+            else:
+                msg = None
+            return eid, msg
+
+    return None, None
+
+
+async def _fetch_completed_items_once(
+    *,
+    keywords: str,
+    condition: Optional[str],
+    max_price: Optional[float],
+    limit: int,
+    relevance_threshold: float,
+    stage: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Single-stage fetch for sold comparables with detailed diagnostics."""
+    diag = _build_comparable_diagnostics(
+        stage=stage,
+        query_used=keywords,
+        condition_used=condition,
+        max_price_used=max_price,
+    )
+
+    app_id = os.getenv("EBAY_APP_ID", "")
+    if not app_id:
+        diag["failure_reason"] = "missing_app_id"
+        logger.warning("fetch_completed_items: EBAY_APP_ID not set")
+        return [], diag
+
+    host = _finding_host()
+    url = f"https://{host}/services/search/FindingService/v1"
+    params: Dict[str, str] = {
+        "OPERATION-NAME": "findCompletedItems",
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": app_id,
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "REST-PAYLOAD": "",
+        "keywords": (keywords or "")[:350],
+        "paginationInput.entriesPerPage": str(min(int(limit), 100)),
+        "itemFilter(0).name": "SoldItemsOnly",
+        "itemFilter(0).value": "true",
+    }
+
+    filt_idx = 1
+    if max_price is not None:
+        params[f"itemFilter({filt_idx}).name"] = "MaxPrice"
+        params[f"itemFilter({filt_idx}).value"] = str(max_price)
+        params[f"itemFilter({filt_idx}).paramName"] = "Currency"
+        params[f"itemFilter({filt_idx}).paramValue"] = "USD"
+        filt_idx += 1
+    if condition == "new":
+        params[f"itemFilter({filt_idx}).name"] = "Condition"
+        params[f"itemFilter({filt_idx}).value"] = "New"
+    elif condition == "used":
+        params[f"itemFilter({filt_idx}).name"] = "Condition"
+        params[f"itemFilter({filt_idx}).value"] = "Used"
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(url, params=params)
+    except Exception as exc:
+        diag["failure_reason"] = "request_error"
+        logger.warning("fetch_completed_items_error: %s", exc)
+        return [], diag
+
+    if resp.status_code != 200:
+        err_id, err_msg = _extract_finding_error(resp)
+        diag["error_id"] = err_id
+        diag["error_message"] = err_msg
+        diag["failure_reason"] = "http_error"
+        if err_id == "10001":
+            diag["failure_reason"] = "rate_limited"
+        logger.warning(
+            "fetch_completed_items_http: status=%s error_id=%s message=%s snippet=%s",
+            resp.status_code,
+            err_id,
+            err_msg,
+            (resp.text or "")[:300].replace("\n", " "),
+        )
+        return [], diag
+
+    try:
+        data = resp.json()
+    except Exception:
+        diag["failure_reason"] = "json_error"
+        logger.warning("fetch_completed_items_json_error")
+        return [], diag
+
+    items_raw: List[Any] = []
+    for resp_block in data.get("findCompletedItemsResponse") or []:
+        if not isinstance(resp_block, dict):
+            continue
+        sr = resp_block.get("searchResult")
+        if isinstance(sr, list):
+            for sr_block in sr:
+                if isinstance(sr_block, dict):
+                    items_raw.extend(sr_block.get("item") or [])
+    diag["api_items_raw_count"] = len(items_raw)
+
+    sold_state_items: List[Dict[str, Any]] = []
+    for item in items_raw:
+        if not isinstance(item, dict):
+            continue
+        selling_status = item.get("sellingStatus")
+        if isinstance(selling_status, list) and selling_status:
+            selling_status = selling_status[0]
+        if not isinstance(selling_status, dict):
+            continue
+        selling_state_raw = selling_status.get("sellingState")
+        if isinstance(selling_state_raw, list) and selling_state_raw:
+            selling_state_raw = selling_state_raw[0]
+        if selling_state_raw == "EndedWithSales":
+            sold_state_items.append(item)
+    diag["sold_state_kept_count"] = len(sold_state_items)
+
+    parsed_rows: List[Dict[str, Any]] = []
+    for item in sold_state_items:
+        selling_status = item.get("sellingStatus")
+        if isinstance(selling_status, list) and selling_status:
+            selling_status = selling_status[0]
+        if not isinstance(selling_status, dict):
+            continue
+
+        price_block = selling_status.get("currentPrice")
+        if isinstance(price_block, list) and price_block:
+            price_block = price_block[0]
+        price_val = price_block.get("__value__") if isinstance(price_block, dict) else None
+        price_cents = None
+        if price_val is not None:
+            try:
+                price_cents = round(float(price_val) * 100)
+            except (TypeError, ValueError):
+                pass
+        if price_cents is None:
+            continue
+
+        title_raw = item.get("title")
+        if isinstance(title_raw, list) and title_raw:
+            title_raw = title_raw[0]
+
+        cond_raw = item.get("condition")
+        if isinstance(cond_raw, list) and cond_raw:
+            cond_raw = cond_raw[0]
+        if isinstance(cond_raw, dict):
+            cond_raw = cond_raw.get("conditionDisplayName")
+            if isinstance(cond_raw, list) and cond_raw:
+                cond_raw = cond_raw[0]
+
+        listing_info = item.get("listingInfo")
+        if isinstance(listing_info, list) and listing_info:
+            listing_info = listing_info[0]
+        end_time_raw = None
+        listing_type_raw = None
+        if isinstance(listing_info, dict):
+            et = listing_info.get("endTime")
+            if isinstance(et, list) and et:
+                et = et[0]
+            end_time_raw = et
+            lt = listing_info.get("listingType")
+            if isinstance(lt, list) and lt:
+                lt = lt[0]
+            listing_type_raw = lt
+
+        parsed_rows.append({
+            "title": str(title_raw or ""),
+            "sold_price_cents": price_cents,
+            "condition": str(cond_raw) if cond_raw else None,
+            "end_time": str(end_time_raw) if end_time_raw else None,
+            "listing_type": str(listing_type_raw) if listing_type_raw else "FixedPrice",
+            "selling_state": "EndedWithSales",
+        })
+    diag["price_parse_kept_count"] = len(parsed_rows)
+
+    filtered_rows = filter_relevant(parsed_rows, keywords, threshold=relevance_threshold)
+    diag["relevance_kept_count"] = len(filtered_rows)
+    diag["final_count"] = len(filtered_rows)
+
+    if not filtered_rows:
+        if diag["api_items_raw_count"] == 0:
+            diag["failure_reason"] = "no_items"
+        elif diag["sold_state_kept_count"] == 0:
+            diag["failure_reason"] = "no_sold_state_items"
+        elif diag["price_parse_kept_count"] == 0:
+            diag["failure_reason"] = "no_priced_items"
+        elif diag["relevance_kept_count"] == 0:
+            diag["failure_reason"] = "all_filtered_by_relevance"
+        else:
+            diag["failure_reason"] = "unknown_empty"
+
+    return filtered_rows, diag
+
+
+async def fetch_completed_items_with_diagnostics(
+    keywords: str,
+    condition: Optional[str] = None,
+    max_price: Optional[float] = None,
+    limit: int = 50,
+    min_comps_threshold: int = 5,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Fetch sold comparables with bounded fallback stages and diagnostics.
+    Stages: strict -> no_condition -> no_max_price -> canonicalized.
+    """
+    cache_key = (
+        keywords or "",
+        condition,
+        max_price,
+        int(limit),
+        int(min_comps_threshold),
+        os.getenv("EBAY_ENVIRONMENT", "PRODUCTION").upper(),
+        os.getenv("EBAY_APP_ID") or "",
+    )
+    now = time.time()
+    cache_ttl = int(os.getenv("FMV_COMPS_CACHE_TTL", "900"))
+    cache_fail_ttl = int(os.getenv("FMV_COMPS_CACHE_FAIL_TTL", "90"))
+    cached = _comps_cache.get(cache_key)
+    if cached and cached.get("expires_at", 0) > now:
+        return cached["rows"], cached["diag"]
+
+    stages: List[Tuple[str, str, Optional[str], Optional[float], float]] = [
+        ("strict", keywords, condition, max_price, 0.30),
+        ("no_condition", keywords, None, max_price, 0.30),
+        ("no_max_price", keywords, None, None, 0.28),
+        ("canonicalized", _canonicalize_comparable_query(keywords), None, None, 0.25),
+    ]
+
+    stage_diags: List[Dict[str, Any]] = []
+    best_rows: List[Dict[str, Any]] = []
+    best_diag: Optional[Dict[str, Any]] = None
+
+    for stage_name, q, cond, mx, rel_th in stages:
+        rows, diag = await _fetch_completed_items_once(
+            keywords=q,
+            condition=cond,
+            max_price=mx,
+            limit=limit,
+            relevance_threshold=rel_th,
+            stage=stage_name,
+        )
+        stage_diags.append(diag)
+        if best_diag is None or len(rows) > len(best_rows):
+            best_rows = rows
+            best_diag = diag
+        if len(rows) >= min_comps_threshold:
+            diag["stages"] = stage_diags
+            logger.info("fetch_completed_items_ok: stage=%s keywords=%r count=%d", stage_name, q[:80], len(rows))
+            _comps_cache[cache_key] = {
+                "rows": rows,
+                "diag": diag,
+                "expires_at": now + cache_ttl,
+            }
+            return rows, diag
+
+        # On hard HTTP/rate-limit failures, retry stages are unlikely to help.
+        if diag.get("failure_reason") in {"http_error", "rate_limited"}:
+            break
+
+    if best_diag is None:
+        best_diag = _build_comparable_diagnostics(
+            stage="strict",
+            query_used=keywords,
+            condition_used=condition,
+            max_price_used=max_price,
+        )
+        best_diag["failure_reason"] = "no_stage_executed"
+
+    best_diag["stages"] = stage_diags
+    if best_diag.get("failure_reason") is None and not best_rows:
+        best_diag["failure_reason"] = "no_comparables_after_fallback"
+    logger.info(
+        "fetch_completed_items_fallback: keywords=%r best_stage=%s best_count=%d reason=%s",
+        keywords[:80],
+        best_diag.get("stage"),
+        len(best_rows),
+        best_diag.get("failure_reason"),
+    )
+    _comps_cache[cache_key] = {
+        "rows": best_rows,
+        "diag": best_diag,
+        "expires_at": now + (cache_fail_ttl if len(best_rows) == 0 else cache_ttl),
+    }
+    return best_rows, best_diag
+
+
+async def fetch_completed_items(
+    keywords: str,
+    condition: Optional[str] = None,
+    max_price: Optional[float] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Backwards-compatible wrapper: returns rows only."""
+    rows, _diag = await fetch_completed_items_with_diagnostics(
+        keywords=keywords,
+        condition=condition,
+        max_price=max_price,
+        limit=limit,
+    )
     return rows
 
 
@@ -332,6 +784,38 @@ class BrowseSellerProfile:
             "condition": self.condition,
             "item_id": self.item_id,
         }
+
+
+async def get_item_detail(item_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch the full Browse API item response as a raw dict.
+    Returns None if OAuth is not configured or the request fails.
+    Contains title, price, condition, seller, returnTerms, etc.
+    """
+    token = await get_application_access_token()
+    if not token:
+        return None
+
+    browse_base = _urls()["browse"]
+    browse_item_id = item_id if "|" in item_id else f"v1|{item_id}|0"
+    url = f"{browse_base}/{browse_item_id}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await _request_with_backoff(client, url, headers)
+
+    if resp is None or resp.status_code != 200:
+        return None
+
+    try:
+        return resp.json()
+    except Exception as exc:
+        logger.warning("ebay_browse_item_detail_error: %s", exc)
+        return None
 
 
 async def get_item_seller_profile(item_id: str) -> Optional[BrowseSellerProfile]:

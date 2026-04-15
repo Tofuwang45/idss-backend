@@ -1,0 +1,300 @@
+[
+  {
+    "id": "d01",
+    "description": "Great deal: well below FMV, trusted seller",
+    "listing": {
+      "title": "Apple MacBook Pro 14 M3 Pro 18GB 512GB",
+      "price_cents": 149900,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [169900, 174900, 172000, 168000, 170000, 171000, 169500, 173000, 175000, 168500, 171500, 172500, 170500, 169000, 174000],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "GOOD",
+    "expected_action": "BUY_NOW"
+  },
+  {
+    "id": "d02",
+    "description": "Fair price, negotiate recommended",
+    "listing": {
+      "title": "Samsung Galaxy S24 Ultra 256GB Unlocked",
+      "price_cents": 109900,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [104900, 107500, 105000, 108000, 106500, 109000, 103000, 107000, 105500, 106000, 108500, 107500, 104000, 106500, 105000],
+    "merchant_report": {"reliability_tier": "MEDIUM", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "NEGOTIATE"
+  },
+  {
+    "id": "d03",
+    "description": "Overpriced: well above FMV",
+    "listing": {
+      "title": "Sony WH-1000XM5 Headphones",
+      "price_cents": 39800,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [27900, 28500, 27000, 29000, 28000, 27500, 29500, 28200, 27800, 28800, 27200, 29200, 28500, 27700, 28300],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "OVERPRICED",
+    "expected_action": "WAIT"
+  },
+  {
+    "id": "d04",
+    "description": "Auction ending soon, bid below ceiling — snipe",
+    "listing": {
+      "title": "Nintendo Switch OLED White",
+      "price_cents": 34900,
+      "condition": "New",
+      "listing_type": "Auction",
+      "current_bid_cents": 22000,
+      "bid_count": 8,
+      "time_remaining_seconds": 180
+    },
+    "comparables_price_cents": [32000, 33000, 31000, 34000, 32500, 33500, 31500, 32000, 34000, 33000, 31000, 32500, 33500, 31500, 34500],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "SNIPE_BID"
+  },
+  {
+    "id": "d05",
+    "description": "Auction early, low velocity — wait",
+    "listing": {
+      "title": "iPad Air M2 256GB WiFi",
+      "price_cents": 59900,
+      "condition": "New",
+      "listing_type": "Auction",
+      "current_bid_cents": 20000,
+      "bid_count": 3,
+      "time_remaining_seconds": 36000
+    },
+    "comparables_price_cents": [55000, 57000, 54000, 56000, 58000, 55500, 57500, 54500, 56500, 58500, 55000, 57000, 54000, 56000, 58000],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "WAIT"
+  },
+  {
+    "id": "d06",
+    "description": "DO_NOT_BUY seller, even if price is good",
+    "listing": {
+      "title": "iPhone 15 Pro 256GB Natural Titanium",
+      "price_cents": 85000,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [99900, 102000, 98000, 100000, 101000, 99000, 103000, 97000, 100500, 99500, 101500, 98500, 100000, 99000, 102000],
+    "merchant_report": {"reliability_tier": "DO_NOT_BUY", "risk_flags": ["NEW_ACCOUNT", "NO_RETURNS"]},
+    "expected_deal_score": "GOOD",
+    "expected_action": "WAIT"
+  },
+  {
+    "id": "d07",
+    "description": "Used item, slightly under FMV — buy",
+    "listing": {
+      "title": "Dell XPS 15 9530 i7 32GB 1TB",
+      "price_cents": 89900,
+      "condition": "Used",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [105000, 110000, 107000, 108000, 112000, 106000, 109000, 111000, 104000, 107500, 108500, 110500, 106500, 109500, 111500],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "GOOD",
+    "expected_action": "BUY_NOW"
+  },
+  {
+    "id": "d08",
+    "description": "Auction: bid already at ceiling",
+    "listing": {
+      "title": "AirPods Pro 2nd Gen USB-C",
+      "price_cents": 24900,
+      "condition": "New",
+      "listing_type": "Auction",
+      "current_bid_cents": 23500,
+      "bid_count": 22,
+      "time_remaining_seconds": 600
+    },
+    "comparables_price_cents": [22000, 23000, 21500, 22500, 23500, 22000, 21000, 23000, 22500, 24000, 21500, 22000, 23500, 22000, 23000],
+    "merchant_report": {"reliability_tier": "MEDIUM", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "WAIT"
+  },
+  {
+    "id": "d09",
+    "description": "Low confidence (few comps) — negotiate cautiously",
+    "listing": {
+      "title": "Rare Vintage Lens Canon FD 50mm f/1.2",
+      "price_cents": 45000,
+      "condition": "Used",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [40000, 42000, 38000],
+    "merchant_report": {"reliability_tier": "MEDIUM", "risk_flags": []},
+    "expected_deal_score": "OVERPRICED",
+    "expected_action": "NEGOTIATE"
+  },
+  {
+    "id": "d10",
+    "description": "AuctionWithBIN: price is a steal",
+    "listing": {
+      "title": "Dyson V15 Detect Cordless Vacuum",
+      "price_cents": 42000,
+      "condition": "New",
+      "listing_type": "AuctionWithBIN",
+      "current_bid_cents": 30000,
+      "bid_count": 5,
+      "time_remaining_seconds": 14400
+    },
+    "comparables_price_cents": [55000, 57000, 54000, 56000, 58000, 55500, 54500, 56500, 57500, 53000, 55000, 56000, 54000, 57000, 58000],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "GOOD",
+    "expected_action": "BUY_NOW"
+  },
+  {
+    "id": "d11",
+    "description": "Slightly overpriced BIN, medium seller — negotiate",
+    "listing": {
+      "title": "Bose QuietComfort Ultra Earbuds",
+      "price_cents": 28900,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [24900, 25500, 25000, 26000, 25500, 24500, 26500, 25000, 24000, 25500, 26000, 24500, 25000, 25500, 26000],
+    "merchant_report": {"reliability_tier": "MEDIUM", "risk_flags": []},
+    "expected_deal_score": "OVERPRICED",
+    "expected_action": "NEGOTIATE"
+  },
+  {
+    "id": "d12",
+    "description": "No comps at all — fallback to FAIR, negotiate",
+    "listing": {
+      "title": "Ultra Rare Custom Mechanical Keyboard",
+      "price_cents": 35000,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [],
+    "merchant_report": {"reliability_tier": "MEDIUM", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "NEGOTIATE"
+  },
+  {
+    "id": "d13",
+    "description": "Individual seller, high-value item",
+    "listing": {
+      "title": "Canon EOS R5 Body Only",
+      "price_cents": 280000,
+      "condition": "Used",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [320000, 310000, 315000, 325000, 305000, 318000, 322000, 308000, 312000, 320000, 316000, 310000, 325000, 318000, 305000],
+    "merchant_report": {"reliability_tier": "LOW", "risk_flags": ["INDIVIDUAL_HIGH_VALUE"]},
+    "expected_deal_score": "GOOD",
+    "expected_action": "BUY_NOW"
+  },
+  {
+    "id": "d14",
+    "description": "Auction snipe: just under 5 min",
+    "listing": {
+      "title": "Lego Star Wars UCS AT-AT 75313",
+      "price_cents": 79999,
+      "condition": "New",
+      "listing_type": "Auction",
+      "current_bid_cents": 55000,
+      "bid_count": 15,
+      "time_remaining_seconds": 240
+    },
+    "comparables_price_cents": [75000, 78000, 72000, 77000, 74000, 76000, 79000, 73000, 75000, 78000, 74000, 77000, 76000, 75000, 73000],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "SNIPE_BID"
+  },
+  {
+    "id": "d15",
+    "description": "Extreme markup on commodity item",
+    "listing": {
+      "title": "Apple AirTag 4 Pack",
+      "price_cents": 12900,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [7900, 8500, 7500, 8000, 8200, 7800, 8300, 7600, 8100, 7900, 8400, 7700, 8000, 8200, 7500],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "OVERPRICED",
+    "expected_action": "WAIT"
+  },
+  {
+    "id": "d16",
+    "description": "Refurbished laptop at good price",
+    "listing": {
+      "title": "ThinkPad X1 Carbon Gen 11 i7 16GB",
+      "price_cents": 89900,
+      "condition": "Certified Refurbished",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [110000, 115000, 108000, 112000, 109000, 113000, 107000, 111000, 114000, 110000, 108000, 112000, 109000, 113000, 107000],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "GOOD",
+    "expected_action": "BUY_NOW"
+  },
+  {
+    "id": "d17",
+    "description": "Auction well above ceiling — wait",
+    "listing": {
+      "title": "PS5 Slim Digital Edition",
+      "price_cents": 44999,
+      "condition": "New",
+      "listing_type": "Auction",
+      "current_bid_cents": 42000,
+      "bid_count": 30,
+      "time_remaining_seconds": 120
+    },
+    "comparables_price_cents": [39900, 41000, 38000, 40000, 42000, 39000, 41500, 38500, 40500, 39500, 41000, 38000, 40000, 39000, 42000],
+    "merchant_report": {"reliability_tier": "HIGH", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "WAIT"
+  },
+  {
+    "id": "d18",
+    "description": "Low seller with decent price — still proceed",
+    "listing": {
+      "title": "Google Pixel 8 Pro 128GB Unlocked",
+      "price_cents": 54900,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [62000, 64000, 61000, 63000, 65000, 62500, 63500, 61500, 64500, 62000, 63000, 61000, 64000, 62500, 65000],
+    "merchant_report": {"reliability_tier": "LOW", "risk_flags": ["LOW_VOLUME"]},
+    "expected_deal_score": "GOOD",
+    "expected_action": "BUY_NOW"
+  },
+  {
+    "id": "d19",
+    "description": "Used phone, price matches market — negotiate",
+    "listing": {
+      "title": "iPhone 14 Pro Max 256GB Space Black",
+      "price_cents": 75000,
+      "condition": "Used",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [72000, 74000, 71000, 73000, 75000, 72500, 73500, 71500, 74500, 72000, 73000, 71000, 74000, 72500, 75000],
+    "merchant_report": {"reliability_tier": "MEDIUM", "risk_flags": []},
+    "expected_deal_score": "FAIR",
+    "expected_action": "NEGOTIATE"
+  },
+  {
+    "id": "d20",
+    "description": "Great deal but DO_NOT_BUY — override to WAIT",
+    "listing": {
+      "title": "Meta Quest 3 128GB",
+      "price_cents": 35000,
+      "condition": "New",
+      "listing_type": "FixedPrice"
+    },
+    "comparables_price_cents": [49900, 52000, 48000, 50000, 51000, 49000, 53000, 47000, 50500, 49500, 51500, 48500, 50000, 49000, 52000],
+    "merchant_report": {"reliability_tier": "DO_NOT_BUY", "risk_flags": ["LOW_VOLUME", "NO_RETURNS"]},
+    "expected_deal_score": "GOOD",
+    "expected_action": "WAIT"
+  }
+]

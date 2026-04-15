@@ -618,6 +618,7 @@ class EbaySellerInfo(BaseModel):
 class EbayResult(BaseModel):
     title: str
     price: Optional[str] = None
+    price_cents: Optional[int] = None
     condition: Optional[str] = None
     url: str
     shipping: Optional[str] = None
@@ -632,6 +633,40 @@ class EbaySearchResponse(BaseModel):
     results: List[EbayResult]
     search_url: str
     source: str  # "api" | "browse" | "rss" | "url_only"
+
+
+class EvaluatedListing(BaseModel):
+    """EbayResult enriched with deal-analysis fields for frontend rendering."""
+    title: str
+    price: Optional[str] = None
+    price_cents: Optional[int] = None
+    condition: Optional[str] = None
+    url: str
+    shipping: Optional[str] = None
+    item_id: Optional[str] = None
+    seller: Optional[EbaySellerInfo] = None
+    merchant_report: Optional[Dict[str, Any]] = None
+
+    deal_score: Optional[str] = None         # "GOOD" | "FAIR" | "OVERPRICED"
+    fmv_cents: Optional[int] = None
+    fmv_confidence: Optional[float] = None
+    recommended_action: Optional[str] = None  # "BUY_NOW" | "NEGOTIATE" | "WAIT" | "SNIPE_BID"
+    action_reasoning: Optional[str] = None
+    target_price_cents: Optional[int] = None
+    risk_level: Optional[str] = None          # "LOW" | "MEDIUM" | "HIGH"
+    suggested_message: Optional[str] = None
+    comparables_used: Optional[int] = None
+    fmv_source: Optional[str] = None        # "sold_history" | "active_market" | None
+    fmv_stage: Optional[str] = None
+    fmv_fallback_reason: Optional[str] = None
+    fmv_query_used: Optional[str] = None
+
+
+class EvaluatedSearchResponse(BaseModel):
+    query: str
+    results: List[EvaluatedListing]
+    search_url: str
+    source: str
 
 
 async def _enrich_results_with_mre(results: List[EbayResult]) -> List[EbayResult]:
@@ -685,10 +720,7 @@ async def _enrich_results_with_mre(results: List[EbayResult]) -> List[EbayResult
                 )
 
         if seller_username:
-            try:
-                price_float = float(r.price.replace("$", "").replace(",", "")) if r.price else None
-            except (ValueError, AttributeError):
-                price_float = None
+            price_float = r.price_cents / 100.0 if r.price_cents else None
 
             report = await compute_merchant_report(
                 seller_username=seller_username,
@@ -888,9 +920,17 @@ async def search_ebay(
 
                 _item_id_raw = item.get("itemId", [None])[0] if isinstance(item.get("itemId"), list) else item.get("itemId")
 
+                _pc = None
+                if price_val:
+                    try:
+                        _pc = round(float(price_val) * 100)
+                    except (TypeError, ValueError):
+                        pass
+
                 results.append(EbayResult(
                     title=item.get("title", [""])[0],
                     price=f"${float(price_val):,.2f}" if price_val else None,
+                    price_cents=_pc,
                     condition=cond or None,
                     url=vcs[0] if vcs else search_url,
                     shipping=ship or None,
@@ -898,6 +938,8 @@ async def search_ebay(
                     seller=seller if seller and seller.seller_username else None,
                 ))
             if results:
+                from app.ebay_seller import relevance_score as _rel_score
+                results = [r for r in results if _rel_score(q, r.title) >= 0.45]
                 results = await _enrich_results_with_mre(results)
                 return EbaySearchResponse(query=q, max_price=max_price, results=results,
                                           search_url=search_url, source="api")
@@ -935,6 +977,7 @@ async def search_ebay(
                     br_results.append(EbayResult(
                         title=row.get("title") or "",
                         price=row.get("price"),
+                        price_cents=row.get("price_cents"),
                         condition=row.get("condition"),
                         url=u,
                         shipping=row.get("shipping"),
@@ -984,13 +1027,21 @@ async def search_ebay(
             desc_html = desc_el.text if desc_el is not None else ""
             price_match = _re_local.search(r"\$[\d,]+(?:\.\d{2})?", desc_html or "")
             price_str = price_match.group(0) if price_match else None
+            _rss_price_cents = None
+            if price_str:
+                try:
+                    _rss_price_cents = round(float(price_str.replace("$", "").replace(",", "")) * 100)
+                except (ValueError, TypeError):
+                    pass
 
             _itm_match = _re_local.search(r'/itm/(\d+)', link)
             _rss_item_id = _itm_match.group(1) if _itm_match else None
 
-            results.append(EbayResult(title=title, price=price_str, url=link, item_id=_rss_item_id))
+            results.append(EbayResult(title=title, price=price_str, price_cents=_rss_price_cents, url=link, item_id=_rss_item_id))
 
         if results:
+            from app.ebay_seller import relevance_score as _rel_score
+            results = [r for r in results if _rel_score(q, r.title) >= 0.45]
             results = await _enrich_results_with_mre(results)
             return EbaySearchResponse(query=q, max_price=max_price, results=results,
                                       search_url=search_url, source="rss")
@@ -1019,6 +1070,454 @@ async def search_ebay(
         results=[],
         search_url=search_url,
         source="url_only",
+    )
+
+
+# ─── MCP Tool Handlers ───────────────────────────────────────────────────────
+
+
+def _ebay_result_to_evaluated(
+    r: EbayResult,
+    fmv_result=None,
+    decision=None,
+    comms_response=None,
+    fmv_source: Optional[str] = None,
+    fmv_stage: Optional[str] = None,
+    fmv_fallback_reason: Optional[str] = None,
+    fmv_query_used: Optional[str] = None,
+) -> EvaluatedListing:
+    """Flatten an EbayResult + optional FMV/Decision/Comms into an EvaluatedListing."""
+    return EvaluatedListing(
+        title=r.title,
+        price=r.price,
+        price_cents=r.price_cents,
+        condition=r.condition,
+        url=r.url,
+        shipping=r.shipping,
+        item_id=r.item_id,
+        seller=r.seller,
+        merchant_report=r.merchant_report,
+        deal_score=fmv_result.deal_score if fmv_result else None,
+        fmv_cents=fmv_result.fair_market_value_cents if fmv_result else None,
+        fmv_confidence=fmv_result.confidence if fmv_result else None,
+        recommended_action=decision.action if decision else None,
+        action_reasoning=decision.reasoning if decision else None,
+        target_price_cents=decision.target_action_price_cents if decision else None,
+        risk_level=decision.risk_level if decision else None,
+        suggested_message=comms_response.suggested_message_text if comms_response else None,
+        comparables_used=fmv_result.comparables_used if fmv_result else None,
+        fmv_source=fmv_source,
+        fmv_stage=fmv_stage,
+        fmv_fallback_reason=fmv_fallback_reason,
+        fmv_query_used=fmv_query_used,
+    )
+
+
+async def _tool_search_and_evaluate_ebay(
+    query: str,
+    condition: Optional[str] = None,
+    max_price: Optional[float] = None,
+    limit: int = 5,
+) -> EvaluatedSearchResponse:
+    """
+    MCP tool handler: search eBay and evaluate each listing against FMV.
+
+    1. search_ebay() for live listings
+    2. fetch_completed_items() once for sold comparables
+    3. compute_fmv() + decide() per listing
+    4. Return EvaluatedSearchResponse
+    """
+    from app.ebay_seller import fetch_completed_items_with_diagnostics
+    from app.market_analysis import compute_fmv, parse_comparables, SoldComparable
+    from app.deal_engine import TargetListing, decide
+
+    limit = max(1, min(int(limit), 20))
+
+    search_resp = await search_ebay(
+        q=query,
+        max_price=max_price,
+        condition=condition,
+        limit=limit,
+    )
+
+    raw_comps, comp_diag = await fetch_completed_items_with_diagnostics(
+        keywords=query,
+        condition=condition,
+        max_price=(max_price * 2) if max_price else None,
+        limit=50,
+    )
+    comparables = parse_comparables(raw_comps)
+
+    # When sold comparables are empty (e.g. rate-limited), build pseudo-
+    # comparables from the active search results so FMV reflects the real
+    # market snapshot rather than echoing each listing's own price.
+    fmv_source = "sold_history"
+    confidence_cap = 1.0
+    if not comparables:
+        from datetime import datetime, timezone
+        priced_results = [r for r in search_resp.results if r.price_cents]
+        if len(priced_results) >= 2:
+            now = datetime.now(timezone.utc)
+            comparables = [
+                SoldComparable(
+                    title=r.title or "",
+                    sold_price_cents=r.price_cents,
+                    condition=r.condition,
+                    end_time=now,
+                    listing_type="FixedPrice",
+                )
+                for r in priced_results
+            ]
+            fmv_source = "active_market"
+            confidence_cap = 0.5
+            logger.info(
+                "fmv_active_market_fallback: query=%r active_comps=%d sold_reason=%s",
+                query[:80],
+                len(comparables),
+                comp_diag.get("failure_reason"),
+            )
+
+    evaluated: List[EvaluatedListing] = []
+    for r in search_resp.results:
+        if not r.price_cents:
+            evaluated.append(_ebay_result_to_evaluated(r))
+            continue
+
+        try:
+            fmv_result = await compute_fmv(
+                target_price_cents=r.price_cents,
+                comparables=comparables,
+                target_condition=r.condition,
+                confidence_cap=confidence_cap,
+            )
+
+            listing = TargetListing(
+                item_id=r.item_id,
+                title=r.title,
+                price_cents=r.price_cents,
+                condition=r.condition,
+                listing_type="FixedPrice",
+                seller_username=r.seller.seller_username if r.seller else None,
+                merchant_report=r.merchant_report,
+            )
+
+            decision = await decide(listing, fmv_result)
+            fallback_reason = None
+            if fmv_result.confidence == 0.0:
+                fallback_reason = comp_diag.get("failure_reason") or "no_comparables"
+            evaluated.append(
+                _ebay_result_to_evaluated(
+                    r,
+                    fmv_result,
+                    decision,
+                    fmv_source=fmv_source,
+                    fmv_stage=comp_diag.get("stage"),
+                    fmv_fallback_reason=fallback_reason,
+                    fmv_query_used=comp_diag.get("query_used"),
+                )
+            )
+        except Exception as exc:
+            logger.warning("tool_search_evaluate_item_error: %s", exc)
+            evaluated.append(
+                _ebay_result_to_evaluated(
+                    r,
+                    fmv_source=fmv_source,
+                    fmv_stage=comp_diag.get("stage"),
+                    fmv_fallback_reason=comp_diag.get("failure_reason"),
+                    fmv_query_used=comp_diag.get("query_used"),
+                )
+            )
+
+    return EvaluatedSearchResponse(
+        query=search_resp.query,
+        results=evaluated,
+        search_url=search_resp.search_url,
+        source=search_resp.source,
+    )
+
+
+async def _tool_evaluate_single_listing(
+    url: str,
+    condition_override: Optional[str] = None,
+    category: str = "default",
+) -> EvaluatedListing:
+    """
+    MCP tool handler: evaluate a single eBay listing by URL.
+
+    1. Parse item_id from URL
+    2. Fetch full item detail via Browse API
+    3. Compute MRE, FMV, decision, and comms
+    4. Return single EvaluatedListing
+    """
+    import re as _re
+    from app.ebay_seller import get_item_detail, fetch_completed_items_with_diagnostics
+    from app.market_analysis import compute_fmv, parse_comparables
+    from app.deal_engine import TargetListing, decide
+    from app.seller_comms import generate_comms
+    from app.merchant_reliability import compute_merchant_report, is_mre_enabled
+
+    match = _re.search(r'/itm/(\d+)', url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid eBay URL. Must contain '/itm/<numeric_id>'.")
+    item_id = match.group(1)
+
+    raw_item = await get_item_detail(item_id)
+    if not raw_item:
+        raise HTTPException(status_code=404, detail=f"Could not fetch item {item_id} from eBay Browse API.")
+
+    title = raw_item.get("title", "")
+    price_block = raw_item.get("price") or {}
+    price_val = price_block.get("value")
+    price_cents = None
+    price_str = None
+    if price_val is not None:
+        try:
+            price_cents = round(float(price_val) * 100)
+            price_str = f"${float(price_val):,.2f}"
+        except (TypeError, ValueError):
+            pass
+
+    item_condition = condition_override or raw_item.get("condition")
+    listing_type_raw = raw_item.get("buyingOptions", [])
+    if isinstance(listing_type_raw, list):
+        if "AUCTION" in listing_type_raw and "FIXED_PRICE" in listing_type_raw:
+            listing_type = "AuctionWithBIN"
+        elif "AUCTION" in listing_type_raw:
+            listing_type = "Auction"
+        else:
+            listing_type = "FixedPrice"
+    else:
+        listing_type = "FixedPrice"
+
+    current_bid_cents = None
+    bid_count = None
+    time_remaining = None
+    if listing_type in ("Auction", "AuctionWithBIN"):
+        cb = raw_item.get("currentBidPrice") or {}
+        cb_val = cb.get("value")
+        if cb_val is not None:
+            try:
+                current_bid_cents = round(float(cb_val) * 100)
+            except (TypeError, ValueError):
+                pass
+        bid_count = raw_item.get("bidCount")
+
+    seller_data = raw_item.get("seller") or {}
+    seller_username = seller_data.get("username")
+
+    seller_info = None
+    if seller_username:
+        fb_pct = None
+        fb_raw = seller_data.get("feedbackPercentage")
+        if fb_raw is not None:
+            try:
+                fb_pct = float(fb_raw)
+            except (TypeError, ValueError):
+                pass
+        fb_score = None
+        fs_raw = seller_data.get("feedbackScore")
+        if fs_raw is not None:
+            try:
+                fb_score = int(fs_raw)
+            except (TypeError, ValueError):
+                pass
+        seller_info = EbaySellerInfo(
+            seller_username=seller_username,
+            feedback_score=fb_score,
+            positive_feedback_pct=fb_pct,
+        )
+
+    merchant_report_dict = None
+    if seller_username and is_mre_enabled():
+        try:
+            has_return = bool(raw_item.get("returnTerms"))
+            account_type = seller_data.get("sellerAccountType")
+            report = await compute_merchant_report(
+                seller_username=seller_username,
+                feedback_score=seller_info.feedback_score if seller_info else None,
+                positive_feedback_pct=seller_info.positive_feedback_pct if seller_info else None,
+                account_type=account_type,
+                has_return_policy=has_return,
+                price_usd=price_cents / 100.0 if price_cents else None,
+            )
+            merchant_report_dict = report.model_dump()
+        except Exception as exc:
+            logger.warning("tool_evaluate_mre_error: %s", exc)
+
+    if not price_cents:
+        return EvaluatedListing(
+            title=title, price=price_str, url=url, item_id=item_id,
+            condition=item_condition, seller=seller_info,
+            merchant_report=merchant_report_dict,
+        )
+
+    raw_comps, comp_diag = await fetch_completed_items_with_diagnostics(
+        keywords=title,
+        condition=item_condition,
+        max_price=(price_cents / 100.0) * 2.0,
+        limit=50,
+    )
+    comparables = parse_comparables(raw_comps)
+
+    fmv_result = await compute_fmv(
+        target_price_cents=price_cents,
+        comparables=comparables,
+        target_condition=item_condition,
+    )
+
+    listing = TargetListing(
+        item_id=item_id,
+        title=title,
+        price_cents=price_cents,
+        condition=item_condition,
+        listing_type=listing_type,
+        current_bid_cents=current_bid_cents,
+        bid_count=bid_count,
+        time_remaining_seconds=time_remaining,
+        seller_username=seller_username,
+        merchant_report=merchant_report_dict,
+    )
+
+    decision = await decide(listing, fmv_result)
+
+    comms_response = None
+    try:
+        comms_response = await generate_comms(
+            listing=listing,
+            decision=decision,
+            category=category,
+        )
+    except Exception as exc:
+        logger.warning("tool_evaluate_comms_error: %s", exc)
+
+    base_result = EbayResult(
+        title=title, price=price_str, price_cents=price_cents,
+        condition=item_condition, url=url, item_id=item_id,
+        seller=seller_info, merchant_report=merchant_report_dict,
+    )
+
+    fallback_reason = None
+    if fmv_result.confidence == 0.0:
+        fallback_reason = comp_diag.get("failure_reason") or "no_comparables"
+    return _ebay_result_to_evaluated(
+        base_result,
+        fmv_result,
+        decision,
+        comms_response,
+        fmv_stage=comp_diag.get("stage"),
+        fmv_fallback_reason=fallback_reason,
+        fmv_query_used=comp_diag.get("query_used"),
+    )
+
+
+# ─── Deal Analysis Endpoint ──────────────────────────────────────────────────
+
+
+class DealAnalysisRequest(BaseModel):
+    """Accept either an item_id (resolved via Browse API) or inline listing data."""
+    item_id: Optional[str] = None
+    title: Optional[str] = None
+    price_cents: Optional[int] = None
+    condition: Optional[str] = None
+    listing_type: str = "FixedPrice"
+    current_bid_cents: Optional[int] = None
+    bid_count: Optional[int] = None
+    time_remaining_seconds: Optional[int] = None
+    keywords_override: Optional[str] = None
+    category: str = "default"
+
+
+class DealAnalysisResponse(BaseModel):
+    target_listing: Dict[str, Any]
+    fmv: Dict[str, Any]
+    decision: Dict[str, Any]
+    comms: Optional[Dict[str, Any]] = None
+
+
+@app.post("/analyze/deal", response_model=DealAnalysisResponse)
+async def analyze_deal(request: DealAnalysisRequest):
+    """
+    Full deal analysis: FMV calculation + decision engine + optional seller comms.
+    """
+    from app.ebay_seller import get_item_seller_profile, fetch_completed_items
+    from app.market_analysis import compute_fmv, parse_comparables
+    from app.deal_engine import TargetListing, decide
+    from app.seller_comms import generate_comms
+    from app.merchant_reliability import compute_merchant_report, is_mre_enabled
+
+    title = request.title
+    price_cents = request.price_cents
+    item_condition = request.condition
+    seller_username = None
+    merchant_report_dict: Optional[Dict[str, Any]] = None
+
+    if request.item_id and (not title or not price_cents):
+        profile = await get_item_seller_profile(request.item_id)
+        if profile:
+            seller_username = profile.username
+            if not item_condition and profile.condition:
+                item_condition = profile.condition
+
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required (or provide item_id for auto-resolve)")
+    if not price_cents:
+        raise HTTPException(status_code=400, detail="price_cents is required")
+
+    if seller_username and is_mre_enabled():
+        try:
+            report = await compute_merchant_report(
+                seller_username=seller_username,
+                price_usd=price_cents / 100.0,
+            )
+            merchant_report_dict = report.model_dump()
+        except Exception as exc:
+            logger.warning("analyze_deal_mre_error: %s", exc)
+
+    listing = TargetListing(
+        item_id=request.item_id,
+        title=title,
+        price_cents=price_cents,
+        condition=item_condition,
+        listing_type=request.listing_type,
+        current_bid_cents=request.current_bid_cents,
+        bid_count=request.bid_count,
+        time_remaining_seconds=request.time_remaining_seconds,
+        seller_username=seller_username,
+        merchant_report=merchant_report_dict,
+        accessories=None,
+    )
+
+    keywords = request.keywords_override or title
+    raw_comps = await fetch_completed_items(
+        keywords=keywords,
+        condition=item_condition,
+        max_price=(price_cents / 100.0) * 2.0,
+        limit=50,
+    )
+    comparables = parse_comparables(raw_comps)
+    fmv_result = await compute_fmv(
+        target_price_cents=price_cents,
+        comparables=comparables,
+        target_condition=item_condition,
+    )
+
+    decision = await decide(listing, fmv_result)
+
+    comms_response = None
+    try:
+        comms_response = await generate_comms(
+            listing=listing,
+            decision=decision,
+            category=request.category,
+        )
+    except Exception as exc:
+        logger.warning("analyze_deal_comms_error: %s", exc)
+
+    return DealAnalysisResponse(
+        target_listing=listing.model_dump(),
+        fmv=fmv_result.model_dump(),
+        decision=decision.model_dump(),
+        comms=comms_response.model_dump() if comms_response else None,
     )
 
 
@@ -1478,11 +1977,21 @@ async def execute_tool(
         elif tool_name == "checkout":
             checkout_req = CheckoutRequest(**params)
             return checkout(checkout_req, db)
-        
+
+        elif tool_name == "search_and_evaluate_ebay":
+            return await _tool_search_and_evaluate_ebay(**params)
+
+        elif tool_name == "evaluate_single_listing":
+            return await _tool_evaluate_single_listing(**params)
+
         else:
             raise HTTPException(
                 status_code=404,
-                detail=f"Tool '{tool_name}' not found. Available tools: search_products, get_product, add_to_cart, checkout"
+                detail=(
+                    f"Tool '{tool_name}' not found. Available tools: "
+                    "search_products, get_product, add_to_cart, checkout, "
+                    "search_and_evaluate_ebay, evaluate_single_listing"
+                ),
             )
     
     except Exception as e:

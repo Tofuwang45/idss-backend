@@ -166,12 +166,123 @@ TOOL_CHECKOUT = {
     }
 }
 
+TOOL_SEARCH_AND_EVALUATE_EBAY = {
+    "name": "search_and_evaluate_ebay",
+    "category": ToolCategory.DISCOVERY,
+    "description": (
+        "Search eBay for used electronics and evaluate each listing against fair market value. "
+        "Returns listings enriched with deal_score, fmv, and a recommended buyer action "
+        "(BUY_NOW, NEGOTIATE, WAIT, SNIPE_BID). Use this when the user wants to find and "
+        "compare deals for a specific product."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "The canonical product model name, e.g. 'MacBook Pro 14 M3' or "
+                    "'Samsung Galaxy S24 Ultra 256GB'. Use the exact model name from user "
+                    "input. Do not embellish or infer specifications not stated by the user."
+                ),
+            },
+            "condition": {
+                "type": "string",
+                "enum": ["new", "used", "refurbished"],
+                "description": (
+                    "Item condition filter. Must be one of: 'new', 'used', 'refurbished'. "
+                    "Do not infer condition if not explicitly stated by the user; omit this "
+                    "parameter to search all conditions."
+                ),
+            },
+            "max_price": {
+                "type": "number",
+                "description": (
+                    "Maximum price in USD. Only set if the user provides an explicit budget. "
+                    "Do not guess a price ceiling."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Number of results to return (1-20). Defaults to 5.",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 5,
+            },
+        },
+        "required": ["query"],
+    },
+    "returns": {
+        "type": "object",
+        "description": (
+            "EvaluatedSearchResponse with query, results (list of EvaluatedListing), "
+            "search_url, and source. Each result includes title, price, price_cents, "
+            "condition, url, seller, merchant_report, deal_score, fmv_cents, "
+            "fmv_confidence, recommended_action, action_reasoning, target_price_cents, "
+            "risk_level, and suggested_message."
+        ),
+    },
+}
+
+TOOL_EVALUATE_SINGLE_LISTING = {
+    "name": "evaluate_single_listing",
+    "category": ToolCategory.DETAIL,
+    "description": (
+        "Evaluate a single eBay listing by URL. Fetches the item detail, computes fair "
+        "market value from recent sold data, determines the optimal buyer action, and "
+        "drafts a seller message. Use this when the user shares a specific eBay link "
+        "and wants to know if it is a good deal."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": (
+                    "A direct eBay listing URL, e.g. 'https://www.ebay.com/itm/123456789'. "
+                    "Must be a valid eBay item URL containing '/itm/' followed by the numeric ID."
+                ),
+            },
+            "condition_override": {
+                "type": "string",
+                "enum": ["new", "used", "refurbished"],
+                "description": (
+                    "Override the listing condition if the user explicitly states it. "
+                    "Must be 'new', 'used', or 'refurbished'. Omit to use the condition "
+                    "reported by eBay."
+                ),
+            },
+            "category": {
+                "type": "string",
+                "enum": ["phone", "laptop", "tablet", "default"],
+                "description": (
+                    "Product category for missing-attribute detection in seller messages. "
+                    "Defaults to 'default'. Set to 'phone', 'laptop', or 'tablet' when the "
+                    "product type is clear from context."
+                ),
+                "default": "default",
+            },
+        },
+        "required": ["url"],
+    },
+    "returns": {
+        "type": "object",
+        "description": (
+            "Single EvaluatedListing with all base listing fields plus deal_score, "
+            "fmv_cents, fmv_confidence, recommended_action, action_reasoning, "
+            "target_price_cents, risk_level, and suggested_message."
+        ),
+    },
+}
+
 # Registry of all tools
 ALL_TOOLS = [
     TOOL_SEARCH_PRODUCTS,
     TOOL_GET_PRODUCT,
     TOOL_ADD_TO_CART,
-    TOOL_CHECKOUT
+    TOOL_CHECKOUT,
+    TOOL_SEARCH_AND_EVALUATE_EBAY,
+    TOOL_EVALUATE_SINGLE_LISTING,
 ]
 
 
