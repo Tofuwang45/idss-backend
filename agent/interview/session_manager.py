@@ -90,6 +90,11 @@ class InterviewSessionState:
     agent_filters: Dict[str, Any] = field(default_factory=dict)  # Slot values gathered by agent
     agent_questions_asked: List[str] = field(default_factory=list)  # Slot names already asked
     agent_history: List[Dict[str, str]] = field(default_factory=list)  # Conversation history for LLM context
+    # Commerce source selection: "web_search" | "catalog" | None (not yet chosen)
+    commerce_search_mode: Optional[str] = None
+    # When the agent reaches recommendations_ready but the user hasn't picked a
+    # source yet, we stash the handoff context so we can resume after their choice.
+    pending_handoff: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
     # In-memory product cache keyed by product_id — NOT serialized to Redis.
     # Accumulates every product dict shown to the user this session so follow-up
     # questions ("tell me more about that first one") never need a DB round-trip.
@@ -141,6 +146,8 @@ class InterviewSessionManager:
             "agent_filters": getattr(state, "agent_filters", {}),
             "agent_questions_asked": getattr(state, "agent_questions_asked", []),
             "agent_history": getattr(state, "agent_history", [])[-10:],
+            "commerce_search_mode": getattr(state, "commerce_search_mode", None),
+            "pending_handoff": getattr(state, "pending_handoff", None),
         }
 
     def _dict_to_state(self, d: Dict[str, Any]) -> InterviewSessionState:
@@ -162,6 +169,8 @@ class InterviewSessionManager:
             agent_filters=d.get("agent_filters", {}),
             agent_questions_asked=d.get("agent_questions_asked", []),
             agent_history=d.get("agent_history", []),
+            commerce_search_mode=d.get("commerce_search_mode"),
+            pending_handoff=d.get("pending_handoff"),
         )
 
     def add_favorite(self, session_id: str, product_id: str) -> None:

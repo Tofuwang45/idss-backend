@@ -386,6 +386,15 @@ class ChatResponse(BaseModel):
     # Latency instrumentation — step-level timings in milliseconds
     timings_ms: Optional[Dict[str, float]] = Field(default=None, description="Per-step latency breakdown (ms)")
 
+    # Web market listings — populated when user picks "Web search" (eBay, etc.)
+    # Each item mirrors EvaluatedListing fields: title, url, price, price_cents,
+    # condition, seller, merchant_report, deal_score, fmv_cents, fmv_confidence,
+    # fmv_source, recommended_action, action_reasoning, target_price_cents, etc.
+    web_market_listings: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Live web market listings (eBay etc.) with deal analysis, populated when user chooses Web search",
+    )
+
     # Cart action — tells the frontend to actually add a product to the cart UI
     # Set when the agent processes an add-to-cart text command.
     cart_action: Optional[Dict[str, Any]] = Field(default=None, description="Cart action: {action, product}")
@@ -482,6 +491,30 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
             question_count=session.question_count,
             domain=session.active_domain,
         )
+
+    # --- Commerce source selection handler ---
+    # When a pending_handoff exists the user was asked "Web search" vs
+    # "Current catalog".  Intercept their reply before any other processing.
+    _SOURCE_WEB = {"web search", "web", "ebay", "live listings", "marketplace"}
+    _SOURCE_CAT = {"current catalog", "catalog", "our catalog", "curated", "database"}
+    if getattr(session, "pending_handoff", None):
+        _choice = msg_lower.strip()
+        _is_web = _choice in _SOURCE_WEB
+        _is_cat = _choice in _SOURCE_CAT
+        if _is_web or _is_cat:
+            session.commerce_search_mode = "web_search" if _is_web else "catalog"
+            handoff = session.pending_handoff
+            session.pending_handoff = None
+            session_manager._persist(session_id)
+
+            if _is_web:
+                return await _handle_web_search_handoff(
+                    handoff, session, session_id, session_manager, request,
+                )
+            else:
+                return await _handle_catalog_handoff(
+                    handoff, session, session_id, session_manager, request,
+                )
 
     # --- Post-recommendation handlers ---
     # If the message carries a [ctx:...] tag the frontend injected, it came from an action
@@ -656,17 +689,62 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
                 agent=agent,
             )
         elif domain in ("laptops", "books", "phones"):
+            # --- Commerce source gate ---
+            # If the user hasn't chosen Web search vs Catalog yet, ask now.
+            if not getattr(session, "commerce_search_mode", None):
+                session.pending_handoff = {
+                    "domain": domain,
+                    "search_filters": search_filters,
+                    "question_count": agent_response.get("question_count", 0),
+                    "original_message": request.message,
+                    "n_rows": request.n_rows or 2,
+                    "n_per_row": request.n_per_row or 3,
+                    "compare_first": _compare_first_vs,
+                }
+                session_manager._persist(session_id)
+                return ChatResponse(
+                    response_type="question",
+                    message=(
+                        "Great, I have a good idea of what you need! "
+                        "Where should we look?\n\n"
+                        "**Web search** checks live marketplace listings "
+                        "(eBay and more coming soon) with deal analysis and seller trust scores.\n\n"
+                        "**Current catalog** searches our curated product database "
+                        "with detailed specs and reviews."
+                    ),
+                    session_id=session_id,
+                    quick_replies=["Web search", "Current catalog"],
+                    filters=search_filters,
+                    preferences=_build_preferences_summary(agent.filters),
+                    question_count=agent_response.get("question_count", 0),
+                    domain=domain,
+                )
+
+            # Source already chosen — route immediately
+            if session.commerce_search_mode == "web_search":
+                handoff = {
+                    "domain": domain,
+                    "search_filters": search_filters,
+                    "question_count": agent_response.get("question_count", 0),
+                    "original_message": request.message,
+                    "n_rows": request.n_rows or 2,
+                    "n_per_row": request.n_per_row or 3,
+                    "compare_first": _compare_first_vs,
+                }
+                return await _handle_web_search_handoff(
+                    handoff, session, session_id, session_manager, request,
+                )
+
             category = "Books" if domain == "books" else "electronics"
             product_type = "book" if domain == "books" else ("phone" if domain == "phones" else "laptop")
             search_filters["category"] = category
             search_filters["product_type"] = product_type
-            # Extract hardware specs (RAM, storage, battery, screen) from user query
             try:
                 from app.query_parser import enhance_search_request
                 _, spec_filters = enhance_search_request(request.message, search_filters)
                 search_filters.update(spec_filters)
             except Exception:
-                pass  # Non-critical: spec extraction failure shouldn't block search
+                pass
             return await _search_and_respond_ecommerce(
                 search_filters, category, domain, session_id, session, session_manager,
                 n_rows=request.n_rows or 2, n_per_row=request.n_per_row or 3,
@@ -3021,6 +3099,140 @@ def _build_preference_ack(filters: Dict[str, Any], domain: str) -> str:
     # Join: first part is the persona, rest are specs
     sentence_body = " ".join(parts)
     return f"Got it — {sentence_body}. Here's what I found:"
+
+
+# ============================================================================
+# Commerce Source Handoff Handlers
+# ============================================================================
+
+async def _handle_web_search_handoff(
+    handoff: Dict[str, Any],
+    session,
+    session_id: str,
+    session_manager,
+    request,
+) -> ChatResponse:
+    """Execute web-market search (eBay + deal analysis) from stashed handoff."""
+    import time
+    from agent.interview.session_manager import STAGE_RECOMMENDATIONS
+    t0 = time.perf_counter()
+
+    domain = handoff["domain"]
+    search_filters = handoff["search_filters"]
+    original_message = handoff.get("original_message", "")
+
+    try:
+        from app.commerce_web_search import run_web_search
+        listings = await run_web_search(
+            filters=search_filters,
+            domain=domain,
+            original_message=original_message,
+            limit=5,
+        )
+    except Exception as exc:
+        logger.error("web_search_handoff_error", str(exc), {"session_id": session_id})
+        listings = []
+
+    session_manager.set_stage(session_id, STAGE_RECOMMENDATIONS)
+
+    if not listings:
+        return ChatResponse(
+            response_type="recommendations",
+            message=(
+                "I searched live marketplace listings but couldn't find matching results right now. "
+                "This can happen due to API rate limits. You can try **Current catalog** for our "
+                "curated database, or try again later."
+            ),
+            session_id=session_id,
+            quick_replies=["Current catalog", "Try again", "Different category"],
+            filters=search_filters,
+            preferences={},
+            question_count=handoff.get("question_count", 0),
+            domain=domain,
+            web_market_listings=[],
+            timings_ms={"web_search_ms": (time.perf_counter() - t0) * 1000},
+        )
+
+    msg_parts = [f"Found **{len(listings)}** live listings with deal analysis:\n"]
+    for i, item in enumerate(listings, 1):
+        title = item.get("title", "Unknown")[:65]
+        price = item.get("price") or ""
+        deal = item.get("deal_score") or ""
+        trust = ""
+        mr = item.get("merchant_report")
+        if mr and isinstance(mr, dict):
+            trust = mr.get("reliability_tier", "")
+        fmv_src = item.get("fmv_source") or ""
+
+        line = f"{i}. **{title}**"
+        if price:
+            line += f" — {price}"
+        badges = []
+        if deal:
+            badges.append(f"Deal: {deal}")
+        if trust:
+            badges.append(f"Trust: {trust}")
+        if fmv_src == "active_market":
+            badges.append("FMV: market snapshot")
+        elif fmv_src == "sold_history":
+            badges.append("FMV: sold history")
+        if badges:
+            line += f"  ({', '.join(badges)})"
+        msg_parts.append(line)
+
+    return ChatResponse(
+        response_type="recommendations",
+        message="\n".join(msg_parts),
+        session_id=session_id,
+        quick_replies=["Current catalog", "More details", "Different category"],
+        filters=search_filters,
+        preferences={},
+        question_count=handoff.get("question_count", 0),
+        domain=domain,
+        web_market_listings=listings,
+        timings_ms={"web_search_ms": (time.perf_counter() - t0) * 1000},
+    )
+
+
+async def _handle_catalog_handoff(
+    handoff: Dict[str, Any],
+    session,
+    session_id: str,
+    session_manager,
+    request,
+) -> ChatResponse:
+    """Resume the standard catalog search path from a stashed handoff."""
+    domain = handoff["domain"]
+    search_filters = dict(handoff["search_filters"])
+
+    category = "Books" if domain == "books" else "electronics"
+    product_type = "book" if domain == "books" else ("phone" if domain == "phones" else "laptop")
+    search_filters["category"] = category
+    search_filters["product_type"] = product_type
+
+    try:
+        from app.query_parser import enhance_search_request
+        _, spec_filters = enhance_search_request(
+            handoff.get("original_message", ""), search_filters,
+        )
+        search_filters.update(spec_filters)
+    except Exception:
+        pass
+
+    agent = None
+    if session.active_domain:
+        from agent.universal_agent import UniversalAgent
+        agent = UniversalAgent.restore_from_session(session_id, session, probe_search_fn=_probe_search)
+
+    return await _search_and_respond_ecommerce(
+        search_filters, category, domain, session_id, session, session_manager,
+        n_rows=handoff.get("n_rows", 2),
+        n_per_row=handoff.get("n_per_row", 3),
+        question_count=handoff.get("question_count", 0),
+        agent=agent,
+        compare_first=handoff.get("compare_first", False),
+        original_message=handoff.get("original_message", ""),
+    )
 
 
 async def _search_and_respond_ecommerce(

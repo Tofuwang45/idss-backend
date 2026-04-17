@@ -56,6 +56,7 @@ from app.endpoints import search_products, get_product, add_to_cart, checkout
 from app.cache import cache_client
 from app.metrics import metrics_collector
 from app.tool_schemas import get_all_tools_for_provider, ALL_TOOLS
+from app.ebay_query_parser import parse_natural_ebay_query
 from app.merchant_feed import export_feed
 from app.idss_adapter import (
     search_products_idss, get_product_universal,
@@ -449,6 +450,37 @@ def _format_response_as_text(response: ChatResponse) -> str:
                 if rating_str:
                     lines.append(f"   {rating_str}")
 
+    # ── Web market listings (eBay deal analysis) ────────────────────────────
+    web_items = getattr(response, "web_market_listings", None)
+    if web_items:
+        lines.append("")
+        lines.append("🛒 *Live Marketplace Listings:*")
+        for i, item in enumerate(web_items[:5], 1):
+            title = (item.get("title") or "Unknown")[:60]
+            price = item.get("price") or ""
+            deal = item.get("deal_score") or ""
+            mr = item.get("merchant_report")
+            trust = mr.get("reliability_tier", "") if isinstance(mr, dict) else ""
+            fmv_src = item.get("fmv_source") or ""
+
+            header = f"{i}. *{title}*"
+            if price:
+                header += f" — {price}"
+            lines.append(header)
+
+            badges: list[str] = []
+            if deal:
+                badges.append(f"Deal: {deal}")
+            if trust:
+                badges.append(f"Seller trust: {trust}")
+            if fmv_src:
+                badges.append(f"FMV: {fmv_src.replace('_', ' ')}")
+            if badges:
+                lines.append(f"   {' · '.join(badges)}")
+            url = item.get("url")
+            if url:
+                lines.append(f"   {url}")
+
     # ── Quick reply suggestions ───────────────────────────────────────────────
     if response.quick_replies:
         lines.append("")
@@ -630,6 +662,7 @@ class EbayResult(BaseModel):
 class EbaySearchResponse(BaseModel):
     query: str
     max_price: Optional[float] = None
+    condition: Optional[str] = None  # effective filter after NL parse ("new"|"used"|"refurbished")
     results: List[EbayResult]
     search_url: str
     source: str  # "api" | "browse" | "rss" | "url_only"
@@ -798,6 +831,11 @@ async def search_ebay(
     import httpx as _httpx
     from urllib.parse import quote as _quote
 
+    _nl = parse_natural_ebay_query(q or "", explicit_max_price=max_price, explicit_condition=condition)
+    q = _nl.clean_query
+    max_price = _nl.max_price
+    condition = _nl.condition
+
     # ── Build canonical eBay search URL ──────────────────────────────────────
     sort_codes = {"price-low": "15", "best-match": "12", "ending-soon": "1"}
     sort_code = sort_codes.get(sort or "best-match", "12")
@@ -941,8 +979,14 @@ async def search_ebay(
                 from app.ebay_seller import relevance_score as _rel_score
                 results = [r for r in results if _rel_score(q, r.title) >= 0.45]
                 results = await _enrich_results_with_mre(results)
-                return EbaySearchResponse(query=q, max_price=max_price, results=results,
-                                          search_url=search_url, source="api")
+                return EbaySearchResponse(
+                    query=q,
+                    max_price=max_price,
+                    condition=condition,
+                    results=results,
+                    search_url=search_url,
+                    source="api",
+                )
         except Exception as _e:
             logger.warning("ebay_api_error: %s", _e)
 
@@ -986,8 +1030,12 @@ async def search_ebay(
                     ))
                 br_results = await _enrich_results_with_mre(br_results)
                 return EbaySearchResponse(
-                    query=q, max_price=max_price, results=br_results,
-                    search_url=search_url, source="browse",
+                    query=q,
+                    max_price=max_price,
+                    condition=condition,
+                    results=br_results,
+                    search_url=search_url,
+                    source="browse",
                 )
     except Exception as _e:
         logger.warning("ebay_browse_search_error: %s", _e)
@@ -1043,8 +1091,14 @@ async def search_ebay(
             from app.ebay_seller import relevance_score as _rel_score
             results = [r for r in results if _rel_score(q, r.title) >= 0.45]
             results = await _enrich_results_with_mre(results)
-            return EbaySearchResponse(query=q, max_price=max_price, results=results,
-                                      search_url=search_url, source="rss")
+            return EbaySearchResponse(
+                query=q,
+                max_price=max_price,
+                condition=condition,
+                results=results,
+                search_url=search_url,
+                source="rss",
+            )
     except asyncio.CancelledError:
         # Genuine task cancellation (eval timeout, shutdown) must propagate.
         # Spurious CancelledError during httpx RSS fetch has been seen on Windows;
@@ -1067,6 +1121,7 @@ async def search_ebay(
     return EbaySearchResponse(
         query=q,
         max_price=max_price,
+        condition=condition,
         results=[],
         search_url=search_url,
         source="url_only",
@@ -1140,10 +1195,12 @@ async def _tool_search_and_evaluate_ebay(
         limit=limit,
     )
 
+    _eff_max = search_resp.max_price
+    _eff_cond = search_resp.condition
     raw_comps, comp_diag = await fetch_completed_items_with_diagnostics(
-        keywords=query,
-        condition=condition,
-        max_price=(max_price * 2) if max_price else None,
+        keywords=search_resp.query,
+        condition=_eff_cond,
+        max_price=(_eff_max * 2) if _eff_max else None,
         limit=50,
     )
     comparables = parse_comparables(raw_comps)
@@ -1172,7 +1229,7 @@ async def _tool_search_and_evaluate_ebay(
             confidence_cap = 0.5
             logger.info(
                 "fmv_active_market_fallback: query=%r active_comps=%d sold_reason=%s",
-                query[:80],
+                search_resp.query[:80],
                 len(comparables),
                 comp_diag.get("failure_reason"),
             )

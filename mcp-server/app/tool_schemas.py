@@ -181,9 +181,11 @@ TOOL_SEARCH_AND_EVALUATE_EBAY = {
             "query": {
                 "type": "string",
                 "description": (
-                    "The canonical product model name, e.g. 'MacBook Pro 14 M3' or "
-                    "'Samsung Galaxy S24 Ultra 256GB'. Use the exact model name from user "
-                    "input. Do not embellish or infer specifications not stated by the user."
+                    "Search keywords or a short natural-language request, e.g. "
+                    "'MacBook Pro 14 M3' or 'Dell laptop under 1000'. Budget phrases "
+                    "(under/below/up to/max/less than …) and simple condition words "
+                    "(new/used/refurbished) in this string are parsed automatically when "
+                    "max_price / condition are omitted."
                 ),
             },
             "condition": {
@@ -198,8 +200,9 @@ TOOL_SEARCH_AND_EVALUATE_EBAY = {
             "max_price": {
                 "type": "number",
                 "description": (
-                    "Maximum price in USD. Only set if the user provides an explicit budget. "
-                    "Do not guess a price ceiling."
+                    "Maximum price in USD. Optional when the budget is only in `query` "
+                    "(e.g. 'under 800'); the server parses it. If both are present, this "
+                    "value wins."
                 ),
             },
             "limit": {

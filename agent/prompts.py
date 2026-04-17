@@ -171,7 +171,9 @@ Context: "Invite input on: Format"
 Question: "What genre of book are you in the mood for? Feel free to also mention if you prefer a specific format."
 Quick replies: ["Fiction", "Mystery/Thriller", "Sci-Fi/Fantasy", "Non-Fiction"]
 
-Generate ONE question. Topic: {slot_name}. Remember: ALWAYS include the invitation at the end."""
+Generate ONE question. Topic: {slot_name}. Remember: ALWAYS include the invitation at the end.
+
+Note: after you finish gathering preferences, the system will ask the user whether to search live marketplace listings (Web search) or the curated catalog. Do NOT promise to search eBay, the web, or any marketplace yourself — the host application handles that step."""
 
 # ============================================================================
 # Recommendation Explanation
