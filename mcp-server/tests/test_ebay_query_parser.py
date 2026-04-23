@@ -23,6 +23,12 @@ def test_explicit_max_price_overrides_parsed():
     assert p.max_price == 800
 
 
+def test_explicit_min_price_in_result():
+    p = parse_natural_ebay_query("Dell laptop", explicit_min_price=700.0, explicit_max_price=1000.0)
+    assert p.min_price == 700.0
+    assert p.max_price == 1000.0
+
+
 def test_min_of_two_budgets():
     p = parse_natural_ebay_query("phone under 900 below 700")
     assert p.max_price == 700.0

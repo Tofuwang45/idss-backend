@@ -700,6 +700,7 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
                     "n_rows": request.n_rows or 2,
                     "n_per_row": request.n_per_row or 3,
                     "compare_first": _compare_first_vs,
+                    "listing_title_hints": _session_listing_title_hints(session),
                 }
                 session_manager._persist(session_id)
                 return ChatResponse(
@@ -730,6 +731,7 @@ async def process_chat(request: ChatRequest) -> ChatResponse:
                     "n_rows": request.n_rows or 2,
                     "n_per_row": request.n_per_row or 3,
                     "compare_first": _compare_first_vs,
+                    "listing_title_hints": _session_listing_title_hints(session),
                 }
                 return await _handle_web_search_handoff(
                     handoff, session, session_id, session_manager, request,
@@ -1150,6 +1152,297 @@ def _explain_best_value(product: dict, domain: str, all_products: Optional[list]
 # Post-Recommendation Handlers
 # ============================================================================
 
+# Matches bare / lightly-decorated budget expressions that a user might send
+# after tapping "Change budget" or as a standalone refinement message.
+# Examples it catches: "$800-$1500", "800-1500", "$1,200", "under $800",
+# "up to 1500", "between 800 and 1500", "less than $900", "over $500", "1200".
+# Intentionally anchored so that long free-form sentences don't false-match;
+# those still go through the LLM intent classifier.
+# Number token: either comma-formatted ("1,200") or plain 2-6 digits ("1200").
+# Plain single-digit numbers like "1" are intentionally rejected — they're
+# never a realistic price and would false-match user messages like "1".
+_BUDGET_NUM = r"(?:\d{1,3}(?:,\d{3})+|\d{2,6})"
+_BARE_BUDGET_RE = re.compile(
+    r"""^\s*
+        (?:keep\s+it\s+)?                             # optional lead-in
+        (?:between\s+)?                               # "between 800 and 1500"
+        \$?\s*(?P<lo>""" + _BUDGET_NUM + r""")
+        \s*(?:-|–|—|to|and)\s*
+        \$?\s*(?P<hi>""" + _BUDGET_NUM + r""")
+        (?:\s*(?:dollars?|usd|bucks))?
+        \s*[.,;!?]*\s*(?:redo|please|thanks?)?\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_UNDER_BUDGET_RE = re.compile(
+    r"^\s*(?:under|below|less\s+than|up\s+to|at\s+most|max(?:imum)?|no\s+more\s+than|budget(?:\s+of)?)\s*\$?\s*("
+    + _BUDGET_NUM + r")(?:\s*(?:dollars?|usd|bucks))?\s*[.,;!?]*\s*$",
+    re.IGNORECASE,
+)
+_OVER_BUDGET_RE = re.compile(
+    r"^\s*(?:over|above|more\s+than|at\s+least|starting\s+at)\s*\$?\s*("
+    + _BUDGET_NUM + r")(?:\s*(?:dollars?|usd|bucks))?\s*[.,;!?]*\s*$",
+    re.IGNORECASE,
+)
+# Plain standalone price needs at least 3 digits (or a dollar sign) so short
+# numeric replies like "2" or "12" don't masquerade as budgets.
+_PLAIN_BUDGET_RE = re.compile(
+    r"^\s*\$\s*(\d{1,3}(?:,\d{3})+|\d{2,6})(?:\s*(?:dollars?|usd|bucks))?\s*[.,;!?]*\s*$"
+    r"|^\s*(\d{3,6}|\d{1,3}(?:,\d{3})+)\s*(?:dollars?|usd|bucks)\s*[.,;!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_bare_budget(msg: str) -> Optional[str]:
+    """Return a canonical budget string (e.g. '$800-$1500', 'under $800') if the
+    user message is predominantly a price expression, else None.
+
+    This is a deterministic fast path so we don't depend on the LLM intent
+    classifier for obvious refinement values typed right after a "Change
+    budget" prompt.
+    """
+    if not msg:
+        return None
+    m = _BARE_BUDGET_RE.match(msg)
+    if m:
+        lo = m.group("lo").replace(",", "")
+        hi = m.group("hi").replace(",", "")
+        try:
+            if int(lo) <= int(hi):
+                return f"${lo}-${hi}"
+        except ValueError:
+            return None
+    m = _UNDER_BUDGET_RE.match(msg)
+    if m:
+        return f"under ${m.group(1).replace(',', '')}"
+    m = _OVER_BUDGET_RE.match(msg)
+    if m:
+        return f"over ${m.group(1).replace(',', '')}"
+    m = _PLAIN_BUDGET_RE.match(msg)
+    if m:
+        num = m.group(1) or m.group(2) or ""
+        return f"${num.replace(',', '')}" if num else None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Looser "anywhere in the sentence" budget extractor — used when we KNOW the
+# user is refining the budget (pending_refine_slot == "budget") or after the
+# strict _parse_bare_budget fast-path has returned None.  Unlike the strict
+# regexes above these use re.search (no ^/$ anchors) and a $100 minimum to
+# guard against false positives like "12 inch" or "option 1".
+# ---------------------------------------------------------------------------
+_ANY_RANGE_BUDGET_RE = re.compile(
+    r"""(?:between\s+|from\s+)?
+        \$?\s*(?P<lo>""" + _BUDGET_NUM + r""")
+        \s*(?:-|\u2013|\u2014|to|and)\s*
+        \$?\s*(?P<hi>""" + _BUDGET_NUM + r""")
+        (?:\s*(?:dollars?|usd|bucks))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_ANY_UNDER_BUDGET_RE = re.compile(
+    r"(?:under|below|less\s+than|up\s+to|at\s+most|no\s+more\s+than|max(?:imum)?|budget(?:\s+of)?"
+    # "cap it at $X" / "cap of $X" / "cap at $X" / "keep it capped at $X" — the
+    # middle ` it ` / ` that ` filler is optional.
+    r"|cap(?:\s+(?:it|that|things?|spending))?(?:\s+(?:at|of|to))?)"
+    r"\s*\$?\s*("
+    + _BUDGET_NUM + r")(?:\s*(?:dollars?|usd|bucks))?",
+    re.IGNORECASE,
+)
+_ANY_OVER_BUDGET_RE = re.compile(
+    r"(?:over|above|more\s+than|at\s+least|starting\s+at|min(?:imum)?|north\s+of)\s*\$?\s*("
+    + _BUDGET_NUM + r")(?:\s*(?:dollars?|usd|bucks))?",
+    re.IGNORECASE,
+)
+# "around 900" / "about 1000" / "roughly $1200" — plain ballpark expression.
+_ANY_AROUND_BUDGET_RE = re.compile(
+    r"(?:around|about|approximately|approx\.?|circa|roughly|near|maybe)\s+\$?\s*("
+    + _BUDGET_NUM + r")(?:\s*(?:dollars?|usd|bucks))?",
+    re.IGNORECASE,
+)
+_ANY_PLAIN_BUDGET_RE = re.compile(
+    r"\$\s*(\d{1,3}(?:,\d{3})+|\d{2,6})(?:\s*(?:dollars?|usd|bucks))?"
+    r"|(?<!\d)(\d{3,6}|\d{1,3}(?:,\d{3})+)\s*(?:dollars?|usd|bucks)",
+    re.IGNORECASE,
+)
+
+
+def _extract_budget_from_any_text(msg: str) -> Optional[str]:
+    """Extract a canonical budget string from a message that may embed the
+    price clause anywhere (e.g. "keep it above $500", "bump to 1000 please",
+    "make it between 800 and 1500 dollars, redo").
+
+    Returns one of: "$800-$1500", "under $800", "over $500", "$1000", or None.
+    Falls through to `_parse_bare_budget` first for the stricter anchored
+    patterns, then does a best-effort search with a $100 floor to avoid false
+    positives on non-price numerics (e.g. screen size "12 inch").
+    """
+    if not msg:
+        return None
+    canon = _parse_bare_budget(msg)
+    if canon:
+        return canon
+
+    # Range ("between 800 and 1500", "800-1500", "$800 to $1500")
+    m = _ANY_RANGE_BUDGET_RE.search(msg)
+    if m:
+        lo = m.group("lo").replace(",", "")
+        hi = m.group("hi").replace(",", "")
+        try:
+            lo_i, hi_i = int(lo), int(hi)
+            if lo_i <= hi_i and hi_i >= 100:
+                return f"${lo}-${hi}"
+        except ValueError:
+            pass
+
+    # Ceiling ("under $800", "no more than 1200", "max 500")
+    m = _ANY_UNDER_BUDGET_RE.search(msg)
+    if m:
+        num = m.group(1).replace(",", "")
+        try:
+            if int(num) >= 100:
+                return f"under ${num}"
+        except ValueError:
+            pass
+
+    # Floor ("over $500", "at least 1000", "keep it above $500")
+    m = _ANY_OVER_BUDGET_RE.search(msg)
+    if m:
+        num = m.group(1).replace(",", "")
+        try:
+            if int(num) >= 100:
+                return f"over ${num}"
+        except ValueError:
+            pass
+
+    # Ballpark ("around 900", "about $1200", "roughly 800")
+    m = _ANY_AROUND_BUDGET_RE.search(msg)
+    if m:
+        num = m.group(1).replace(",", "")
+        try:
+            if int(num) >= 100:
+                return f"${num}"
+        except ValueError:
+            pass
+
+    # Plain "$1000" or "1000 dollars"
+    m = _ANY_PLAIN_BUDGET_RE.search(msg)
+    if m:
+        num = (m.group(1) or m.group(2) or "").replace(",", "")
+        try:
+            if num and int(num) >= 100:
+                return f"${num}"
+        except ValueError:
+            pass
+    return None
+
+
+async def _dispatch_search_respecting_mode(
+    *,
+    request: ChatRequest,
+    session,
+    session_id: str,
+    session_manager,
+    active_domain: str,
+    agent: "UniversalAgent",
+    search_filters: Dict[str, Any],
+    original_message: str,
+) -> ChatResponse:
+    """Re-run a search after a refinement, honoring the user's prior commerce
+    source choice: if they picked "Web search" earlier, stay on the web/eBay
+    path; otherwise use the catalog path (or vehicles, for cars).
+    """
+    if active_domain == "vehicles":
+        return await _search_and_respond_vehicles(
+            search_filters, session_id, session, session_manager,
+            n_rows=request.n_rows or 3, n_per_row=request.n_per_row or 3,
+            method=request.method or "embedding_similarity",
+            question_count=session.question_count,
+            agent=agent,
+        )
+
+    if getattr(session, "commerce_search_mode", None) == "web_search" and active_domain in ("laptops", "books", "phones"):
+        handoff = {
+            "domain": active_domain,
+            "search_filters": search_filters,
+            "question_count": session.question_count,
+            "original_message": original_message or "",
+            "n_rows": request.n_rows or 2,
+            "n_per_row": request.n_per_row or 3,
+            "compare_first": False,
+            "listing_title_hints": _session_listing_title_hints(session),
+        }
+        return await _handle_web_search_handoff(
+            handoff, session, session_id, session_manager, request,
+        )
+
+    if active_domain in ("laptops", "books", "phones"):
+        category = _domain_to_category(active_domain)
+        product_type = "laptop" if active_domain == "laptops" else ("phone" if active_domain == "phones" else "book")
+        search_filters["category"] = category
+        search_filters["product_type"] = product_type
+        return await _search_and_respond_ecommerce(
+            search_filters, category, active_domain, session_id, session, session_manager,
+            n_rows=request.n_rows or 2, n_per_row=request.n_per_row or 3,
+            question_count=session.question_count,
+            agent=agent,
+        )
+
+    return ChatResponse(
+        response_type="question",
+        message="I've updated your preferences. What would you like to do next?",
+        session_id=session_id,
+        quick_replies=["Laptops", "Vehicles", "Books"],
+        filters=search_filters,
+        preferences={},
+        question_count=session.question_count,
+        domain=active_domain,
+    )
+
+
+async def _apply_slot_value_and_research(
+    *,
+    slot: str,
+    value: str,
+    request: ChatRequest,
+    session,
+    session_id: str,
+    session_manager,
+    active_domain: str,
+) -> ChatResponse:
+    """Persist a single refined slot value on the agent and re-run the search.
+
+    Used by (a) the `pending_refine_slot` handler after the user types a value
+    in response to "What's your new budget?" and (b) the deterministic bare-
+    budget fast path.
+    """
+    agent = UniversalAgent.restore_from_session(session_id, session, probe_search_fn=_probe_search)
+    agent.filters[slot] = value
+    try:
+        session.pending_refine_slot = None
+        session_manager._persist(session_id)
+    except Exception:
+        pass
+    search_filters = agent.get_search_filters()
+    agent_state = agent.get_state()
+    session.agent_filters = agent_state["filters"]
+    session.agent_questions_asked = agent_state["questions_asked"]
+    session.agent_history = agent_state["history"]
+    session_manager.update_filters(session_id, search_filters, replace=True)
+    session_manager._persist(session_id)
+    return await _dispatch_search_respecting_mode(
+        request=request,
+        session=session,
+        session_id=session_id,
+        session_manager=session_manager,
+        active_domain=active_domain,
+        agent=agent,
+        search_filters=search_filters,
+        original_message=request.message,
+    )
+
+
 async def _handle_post_recommendation(
     request: ChatRequest, session, session_id: str, session_manager
 ) -> Optional[ChatResponse]:
@@ -1197,6 +1490,118 @@ async def _handle_post_recommendation(
         )
 
     msg_lower = clean_message.lower()
+
+    # -----------------------------------------------------------------------
+    # Pending refine-slot interception: if the previous turn asked the user
+    # "What's your new budget?" / "Which brand?" / …, treat THIS message as
+    # the value for that slot and re-run the search (respecting web vs
+    # catalog mode).  This avoids depending on the LLM intent classifier for
+    # bare values like "$800-$1500".
+    # -----------------------------------------------------------------------
+    _pending_slot = getattr(session, "pending_refine_slot", None)
+    if _pending_slot:
+        cancel_phrases = ("cancel", "never mind", "nevermind", "back", "skip", "nothing")
+        if msg_lower.strip() in cancel_phrases:
+            session.pending_refine_slot = None
+            try:
+                session_manager._persist(session_id)
+            except Exception:
+                pass
+        else:
+            session_manager.add_message(session_id, "user", request.message)
+            if _pending_slot == "budget":
+                # Use the looser "anywhere in the text" extractor here because
+                # the user just answered "What's your new budget?" — phrasings
+                # like "keep it above $500" or "make it between 800 and 1500
+                # dollars, redo" must be recognized.
+                _canon = _extract_budget_from_any_text(clean_message) or clean_message.strip()
+                return await _apply_slot_value_and_research(
+                    slot="budget",
+                    value=_canon,
+                    request=request,
+                    session=session,
+                    session_id=session_id,
+                    session_manager=session_manager,
+                    active_domain=active_domain,
+                )
+            if _pending_slot == "brand":
+                return await _apply_slot_value_and_research(
+                    slot="brand",
+                    value=clean_message.strip(),
+                    request=request,
+                    session=session,
+                    session_id=session_id,
+                    session_manager=session_manager,
+                    active_domain=active_domain,
+                )
+            if _pending_slot == "screen_size":
+                _ss = clean_message.strip()
+                _ss_m = re.match(r'^(\d+\.?\d*)\s*(?:["\u201d]|inch(?:es?)?)?$', _ss, re.IGNORECASE)
+                if _ss_m:
+                    _ss = _ss_m.group(1)
+                return await _apply_slot_value_and_research(
+                    slot="screen_size",
+                    value=_ss,
+                    request=request,
+                    session=session,
+                    session_id=session_id,
+                    session_manager=session_manager,
+                    active_domain=active_domain,
+                )
+            if _pending_slot == "requirement":
+                session.pending_refine_slot = None
+                try:
+                    session_manager._persist(session_id)
+                except Exception:
+                    pass
+
+    # -----------------------------------------------------------------------
+    # "Try again" / "retry" handler — re-runs the most recent web search with
+    # the same filters.  Only fires when the user previously chose "Web
+    # search" AND a prior handoff stashed filters on the session.
+    # -----------------------------------------------------------------------
+    _retry_phrases = ("try again", "retry", "search again", "run it again", "run again")
+    if msg_lower.strip() in _retry_phrases and getattr(session, "last_web_search_filters", None):
+        _last = session.last_web_search_filters
+        session_manager.add_message(session_id, "user", request.message)
+        return await _handle_web_search_handoff(
+            {
+                "domain": _last.get("domain", active_domain),
+                "search_filters": _last.get("search_filters", {}),
+                "original_message": _last.get("original_message", ""),
+                "question_count": _last.get("question_count", session.question_count),
+                "n_rows": _last.get("n_rows", 2),
+                "n_per_row": _last.get("n_per_row", 3),
+                "compare_first": _last.get("compare_first", False),
+                "listing_title_hints": _last.get("listing_title_hints")
+                or _session_listing_title_hints(session),
+            },
+            session,
+            session_id,
+            session_manager,
+            request,
+        )
+
+    # -----------------------------------------------------------------------
+    # Deterministic bare-budget fast path — catches "$800-$1500", "under $900",
+    # "between 800 and 1500", "$1200" typed as a standalone refinement without
+    # any leading slot prompt.  First tries the strict anchored parser, then
+    # falls back to the "anywhere in the text" extractor for phrased forms
+    # like "keep it between 800 and 1500 dollars, redo".  Always interpreted
+    # as a budget refinement so we don't rely on the LLM classifier for
+    # obvious price patterns.
+    # -----------------------------------------------------------------------
+    _canon_budget = _parse_bare_budget(clean_message) or _extract_budget_from_any_text(clean_message)
+    if _canon_budget and active_domain:
+        return await _apply_slot_value_and_research(
+            slot="budget",
+            value=_canon_budget,
+            request=request,
+            session=session,
+            session_id=session_id,
+            session_manager=session_manager,
+            active_domain=active_domain,
+        )
 
     # -----------------------------------------------------------------------
     # Popular-question cache — instant answers, no LLM call needed
@@ -1981,6 +2386,11 @@ async def _handle_post_recommendation(
     # -----------------------------------------------------------------------
     if msg_lower == "change budget":
         session_manager.add_message(session_id, "user", request.message)
+        session.pending_refine_slot = "budget"
+        try:
+            session_manager._persist(session_id)
+        except Exception:
+            pass
         return ChatResponse(
             response_type="question",
             message="What's your new budget? For example: 'under $500', '$600–$900', or 'up to $1,200'.",
@@ -1994,6 +2404,11 @@ async def _handle_post_recommendation(
 
     if msg_lower == "different screen size":
         session_manager.add_message(session_id, "user", request.message)
+        session.pending_refine_slot = "screen_size"
+        try:
+            session_manager._persist(session_id)
+        except Exception:
+            pass
         size_qr = (
             ["13 inch", "14 inch", "15.6 inch", "17 inch"]
             if active_domain == "laptops"
@@ -2012,6 +2427,11 @@ async def _handle_post_recommendation(
 
     if msg_lower == "different brand":
         session_manager.add_message(session_id, "user", request.message)
+        session.pending_refine_slot = "brand"
+        try:
+            session_manager._persist(session_id)
+        except Exception:
+            pass
         if active_domain == "laptops":
             brand_qr = ["HP", "Dell", "ASUS", "Lenovo", "Acer"]
         elif active_domain in ("vehicles", "cars"):
@@ -2031,6 +2451,11 @@ async def _handle_post_recommendation(
 
     if msg_lower == "add a requirement":
         session_manager.add_message(session_id, "user", request.message)
+        session.pending_refine_slot = "requirement"
+        try:
+            session_manager._persist(session_id)
+        except Exception:
+            pass
         return ChatResponse(
             response_type="question",
             message="What additional requirement would you like to add? For example: 'touchscreen', 'backlit keyboard', '16GB RAM', 'fast SSD', or 'gaming GPU'.",
@@ -2059,15 +2484,16 @@ async def _handle_post_recommendation(
             session.agent_filters = agent_state["filters"]
             session_manager.update_filters(session_id, search_filters)
             session_manager._persist(session_id)
-            if active_domain in ("laptops", "books"):
-                category = _domain_to_category(active_domain)
-                search_filters["category"] = category
-                search_filters["product_type"] = "laptop" if active_domain == "laptops" else "book"
-                return await _search_and_respond_ecommerce(
-                    search_filters, category, active_domain, session_id, session, session_manager,
-                    n_rows=request.n_rows or 2, n_per_row=request.n_per_row or 3,
-                    question_count=session.question_count,
+            if active_domain in ("laptops", "books", "phones"):
+                return await _dispatch_search_respecting_mode(
+                    request=request,
+                    session=session,
+                    session_id=session_id,
+                    session_manager=session_manager,
+                    active_domain=active_domain,
                     agent=agent,
+                    search_filters=search_filters,
+                    original_message=request.message,
                 )
 
     # -----------------------------------------------------------------------
@@ -2091,22 +2517,15 @@ async def _handle_post_recommendation(
         session.agent_filters = agent_state["filters"]
         session_manager.update_filters(session_id, search_filters)
         session_manager._persist(session_id)
-        if active_domain == "vehicles":
-            return await _search_and_respond_vehicles(
-                search_filters, session_id, session, session_manager,
-                n_rows=request.n_rows or 3, n_per_row=request.n_per_row or 3,
-                method=request.method or "embedding_similarity",
-                question_count=session.question_count,
-                agent=agent,
-            )
-        category = _domain_to_category(active_domain)
-        search_filters["category"] = category
-        search_filters["product_type"] = "laptop" if active_domain == "laptops" else "book"
-        return await _search_and_respond_ecommerce(
-            search_filters, category, active_domain, session_id, session, session_manager,
-            n_rows=request.n_rows or 2, n_per_row=request.n_per_row or 3,
-            question_count=session.question_count,
+        return await _dispatch_search_respecting_mode(
+            request=request,
+            session=session,
+            session_id=session_id,
+            session_manager=session_manager,
+            active_domain=active_domain,
             agent=agent,
+            search_filters=search_filters,
+            original_message=request.message,
         )
 
     # -----------------------------------------------------------------------
@@ -2770,36 +3189,27 @@ async def _handle_post_recommendation(
         )
 
     if refinement.get("response_type") == "recommendations_ready":
-        # Refinement or new search — re-run search with updated filters
+        # Refinement or new search — re-run search with updated filters.
+        # Route to the web/eBay path if the user previously chose "Web search",
+        # otherwise to catalog (or vehicles).
         session_manager.add_message(session_id, "user", request.message)
         search_filters = agent.get_search_filters()
-        # Persist updated agent state
         agent_state = agent.get_state()
         session.agent_filters = agent_state["filters"]
         session.agent_questions_asked = agent_state["questions_asked"]
         session.agent_history = agent_state["history"]
         session_manager.update_filters(session_id, search_filters, replace=True)
         session_manager._persist(session_id)
-
-        if active_domain == "vehicles":
-            return await _search_and_respond_vehicles(
-                search_filters, session_id, session, session_manager,
-                n_rows=request.n_rows or 3, n_per_row=request.n_per_row or 3,
-                method=request.method or "embedding_similarity",
-                question_count=session.question_count,
-                agent=agent,
-            )
-        elif active_domain in ("laptops", "books"):
-            category = _domain_to_category(active_domain)
-            product_type = "laptop" if active_domain == "laptops" else "book"
-            search_filters["category"] = category
-            search_filters["product_type"] = product_type
-            return await _search_and_respond_ecommerce(
-                search_filters, category, active_domain, session_id, session, session_manager,
-                n_rows=request.n_rows or 2, n_per_row=request.n_per_row or 3,
-                question_count=session.question_count,
-                agent=agent,
-            )
+        return await _dispatch_search_respecting_mode(
+            request=request,
+            session=session,
+            session_id=session_id,
+            session_manager=session_manager,
+            active_domain=active_domain,
+            agent=agent,
+            search_filters=search_filters,
+            original_message=request.message,
+        )
 
     # Not a refinement — treat as a contextual follow-up about the existing recommendations.
     # Returning None here would trigger agent.process_message() which may lose the domain
@@ -3105,6 +3515,16 @@ def _build_preference_ack(filters: Dict[str, Any], domain: str) -> str:
 # Commerce Source Handoff Handlers
 # ============================================================================
 
+def _session_listing_title_hints(session) -> List[str]:
+    """Names from the last catalog recommendations — used as SerpAPI sold-comp queries."""
+    out: List[str] = []
+    for p in (getattr(session, "last_recommendation_data", None) or [])[:8]:
+        n = p.get("name") or p.get("title")
+        if n and str(n).strip():
+            out.append(str(n).strip())
+    return out
+
+
 async def _handle_web_search_handoff(
     handoff: Dict[str, Any],
     session,
@@ -3120,6 +3540,28 @@ async def _handle_web_search_handoff(
     domain = handoff["domain"]
     search_filters = handoff["search_filters"]
     original_message = handoff.get("original_message", "")
+    _hints_raw = handoff.get("listing_title_hints")
+    if isinstance(_hints_raw, list) and _hints_raw:
+        listing_title_hints = [str(h).strip() for h in _hints_raw if str(h).strip()]
+    else:
+        listing_title_hints = _session_listing_title_hints(session)
+
+    # Stash the filters and last domain so the "Try again" quick-reply (shown
+    # when eBay returns 0 listings) can re-run the same search.
+    try:
+        session.last_web_search_filters = {
+            "domain": domain,
+            "search_filters": search_filters,
+            "original_message": original_message,
+            "question_count": handoff.get("question_count", 0),
+            "n_rows": handoff.get("n_rows", 2),
+            "n_per_row": handoff.get("n_per_row", 3),
+            "compare_first": handoff.get("compare_first", False),
+            "listing_title_hints": listing_title_hints,
+        }
+        session_manager._persist(session_id)
+    except Exception:
+        pass
 
     try:
         from app.commerce_web_search import run_web_search
@@ -3128,6 +3570,7 @@ async def _handle_web_search_handoff(
             domain=domain,
             original_message=original_message,
             limit=5,
+            listing_title_hints=listing_title_hints or None,
         )
     except Exception as exc:
         logger.error("web_search_handoff_error", str(exc), {"session_id": session_id})
@@ -3136,15 +3579,24 @@ async def _handle_web_search_handoff(
     session_manager.set_stage(session_id, STAGE_RECOMMENDATIONS)
 
     if not listings:
+        # Suggest a concrete "broaden" value the user can one-tap.  Pick a
+        # ceiling that's 1.5x the current max (or $2000 for laptops / $50 for
+        # books / $1500 for phones if no ceiling was set).
+        _cur_max_cents = search_filters.get("price_max_cents") or 0
+        if _cur_max_cents and _cur_max_cents > 0:
+            _broaden_ceiling = int((_cur_max_cents / 100) * 1.5)
+        else:
+            _broaden_ceiling = {"laptops": 2000, "books": 50, "phones": 1500}.get(domain, 2000)
+        _broaden_label = f"Broaden to under ${_broaden_ceiling:,}"
         return ChatResponse(
             response_type="recommendations",
             message=(
                 "I searched live marketplace listings but couldn't find matching results right now. "
-                "This can happen due to API rate limits. You can try **Current catalog** for our "
-                "curated database, or try again later."
+                "This can happen due to API rate limits or a narrow budget. You can try "
+                "**Current catalog** for our curated database, broaden the budget, or try again later."
             ),
             session_id=session_id,
-            quick_replies=["Current catalog", "Try again", "Different category"],
+            quick_replies=["Current catalog", "Try again", _broaden_label, "Different category"],
             filters=search_filters,
             preferences={},
             question_count=handoff.get("question_count", 0),

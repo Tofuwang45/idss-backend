@@ -10,6 +10,7 @@ from app.market_analysis import (
     SoldComparable,
     compute_fmv,
     iqr_filter,
+    narrow_comparables_to_price_band,
     parse_comparables,
     time_decay_weights,
     weighted_median,
@@ -155,3 +156,21 @@ class TestParseComparables:
         raw = [{"title": "Bad"}, {"title": "OK", "sold_price_cents": 3000, "end_time": "2025-01-01T00:00:00Z"}]
         comps = parse_comparables(raw)
         assert len(comps) == 1
+
+
+class TestNarrowComparablesToPriceBand:
+    def test_filters_cheap_outliers_when_enough_remain(self):
+        comps = [
+            _make_comp(20_000),
+            _make_comp(75_000),
+            _make_comp(80_000),
+            _make_comp(85_000),
+        ]
+        out = narrow_comparables_to_price_band(comps, 700.0, 1000.0, keep_at_least=3)
+        assert len(out) == 3
+        assert all(c.sold_price_cents >= 60_000 for c in out)
+
+    def test_noop_when_too_few_after_filter(self):
+        comps = [_make_comp(20_000), _make_comp(25_000)]
+        out = narrow_comparables_to_price_band(comps, 700.0, 1000.0, keep_at_least=3)
+        assert out == comps

@@ -131,17 +131,23 @@ class TestFormatWebListings:
         assert "Marketplace" not in text
 
 
-# ── 4. _max_price_from_filters ──────────────────────────────────────────────
+# ── 4. _price_bounds_usd_from_filters ───────────────────────────────────────
 
-class TestMaxPrice:
+class TestPriceBounds:
     def test_cents_budget(self):
-        from app.commerce_web_search import _max_price_from_filters
-        assert _max_price_from_filters({"budget": 150000}) == 1500.0
+        from app.commerce_web_search import _price_bounds_usd_from_filters
+        assert _price_bounds_usd_from_filters({"budget": 150000}) == (None, 1500.0)
 
     def test_dollar_budget(self):
-        from app.commerce_web_search import _max_price_from_filters
-        assert _max_price_from_filters({"budget": 800}) == 800.0
+        from app.commerce_web_search import _price_bounds_usd_from_filters
+        assert _price_bounds_usd_from_filters({"budget": 800}) == (None, 800.0)
 
     def test_none_budget(self):
-        from app.commerce_web_search import _max_price_from_filters
-        assert _max_price_from_filters({}) is None
+        from app.commerce_web_search import _price_bounds_usd_from_filters
+        assert _price_bounds_usd_from_filters({}) == (None, None)
+
+    def test_range_from_cents_keys(self):
+        from app.commerce_web_search import _price_bounds_usd_from_filters
+        assert _price_bounds_usd_from_filters(
+            {"price_min_cents": 70000, "price_max_cents": 100000},
+        ) == (700.0, 1000.0)

@@ -15,7 +15,7 @@ import time
 import asyncio
 import logging
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import re
 
@@ -290,15 +290,21 @@ def _rows_from_item_summaries(summaries: List[Any], lim: int) -> List[Dict[str, 
 async def search_item_summaries(
     q: str,
     limit: int = 10,
+    min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     condition: Optional[str] = None,
     sort: Optional[str] = "best-match",
+    category_ids: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Keyword search via Browse API GET /buy/browse/v1/item_summary/search.
 
     Uses OAuth application token (same as item detail). Separate quota from
     the legacy Finding API — useful when Finding returns error 10001 rate limits.
+
+    ``category_ids`` pins the search to a specific eBay leaf category (e.g.
+    ``"177"`` for PC Laptops & Netbooks) so laptop queries don't return
+    backpacks / pencil cases / planners that share keyword overlap.
     """
     if not is_browse_configured():
         return []
@@ -316,10 +322,18 @@ async def search_item_summaries(
     }
     if sort == "price-low":
         params["sort"] = "price"
+    if category_ids:
+        params["category_ids"] = str(category_ids)
 
     filter_parts: List[str] = []
-    if max_price is not None:
+    if min_price is not None and max_price is not None:
+        filter_parts.append(f"price:[{int(min_price)}..{int(max_price)}]")
+        filter_parts.append("priceCurrency:USD")
+    elif max_price is not None:
         filter_parts.append(f"price:[0..{int(max_price)}]")
+        filter_parts.append("priceCurrency:USD")
+    elif min_price is not None:
+        filter_parts.append(f"price:[{int(min_price)}..1000000]")
         filter_parts.append("priceCurrency:USD")
     if condition == "new":
         filter_parts.append("conditions:{NEW}")
@@ -406,12 +420,14 @@ def _build_comparable_diagnostics(
     stage: str,
     query_used: str,
     condition_used: Optional[str],
-    max_price_used: Optional[float],
+    min_price_used: Optional[float] = None,
+    max_price_used: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "stage": stage,
         "query_used": query_used,
         "condition_used": condition_used,
+        "min_price_used": min_price_used,
         "max_price_used": max_price_used,
         "api_items_raw_count": 0,
         "sold_state_kept_count": 0,
@@ -462,7 +478,8 @@ async def _fetch_completed_items_once(
     *,
     keywords: str,
     condition: Optional[str],
-    max_price: Optional[float],
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
     limit: int,
     relevance_threshold: float,
     stage: str,
@@ -472,6 +489,7 @@ async def _fetch_completed_items_once(
         stage=stage,
         query_used=keywords,
         condition_used=condition,
+        min_price_used=min_price,
         max_price_used=max_price,
     )
 
@@ -496,6 +514,12 @@ async def _fetch_completed_items_once(
     }
 
     filt_idx = 1
+    if min_price is not None:
+        params[f"itemFilter({filt_idx}).name"] = "MinPrice"
+        params[f"itemFilter({filt_idx}).value"] = str(min_price)
+        params[f"itemFilter({filt_idx}).paramName"] = "Currency"
+        params[f"itemFilter({filt_idx}).paramValue"] = "USD"
+        filt_idx += 1
     if max_price is not None:
         params[f"itemFilter({filt_idx}).name"] = "MaxPrice"
         params[f"itemFilter({filt_idx}).value"] = str(max_price)
@@ -505,9 +529,11 @@ async def _fetch_completed_items_once(
     if condition == "new":
         params[f"itemFilter({filt_idx}).name"] = "Condition"
         params[f"itemFilter({filt_idx}).value"] = "New"
+        filt_idx += 1
     elif condition == "used":
         params[f"itemFilter({filt_idx}).name"] = "Condition"
         params[f"itemFilter({filt_idx}).value"] = "Used"
+        filt_idx += 1
 
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
@@ -647,17 +673,19 @@ async def _fetch_completed_items_once(
 async def fetch_completed_items_with_diagnostics(
     keywords: str,
     condition: Optional[str] = None,
+    min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     limit: int = 50,
     min_comps_threshold: int = 5,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Fetch sold comparables with bounded fallback stages and diagnostics.
-    Stages: strict -> no_condition -> no_max_price -> canonicalized.
+    Stages: strict -> no_condition -> (optional) drop max keep min -> no_max_price -> canonicalized.
     """
     cache_key = (
         keywords or "",
         condition,
+        min_price,
         max_price,
         int(limit),
         int(min_comps_threshold),
@@ -671,21 +699,28 @@ async def fetch_completed_items_with_diagnostics(
     if cached and cached.get("expires_at", 0) > now:
         return cached["rows"], cached["diag"]
 
-    stages: List[Tuple[str, str, Optional[str], Optional[float], float]] = [
-        ("strict", keywords, condition, max_price, 0.30),
-        ("no_condition", keywords, None, max_price, 0.30),
-        ("no_max_price", keywords, None, None, 0.28),
-        ("canonicalized", _canonicalize_comparable_query(keywords), None, None, 0.25),
+    stages: List[Tuple[str, str, Optional[str], Optional[float], Optional[float], float]] = [
+        ("strict", keywords, condition, min_price, max_price, 0.30),
+        ("no_condition", keywords, None, min_price, max_price, 0.30),
     ]
+    if min_price is not None:
+        stages.append(("no_max_keep_min", keywords, None, min_price, None, 0.28))
+    stages.extend(
+        [
+            ("no_max_price", keywords, None, None, None, 0.28),
+            ("canonicalized", _canonicalize_comparable_query(keywords), None, None, None, 0.25),
+        ]
+    )
 
     stage_diags: List[Dict[str, Any]] = []
     best_rows: List[Dict[str, Any]] = []
     best_diag: Optional[Dict[str, Any]] = None
 
-    for stage_name, q, cond, mx, rel_th in stages:
+    for stage_name, q, cond, mn, mx, rel_th in stages:
         rows, diag = await _fetch_completed_items_once(
             keywords=q,
             condition=cond,
+            min_price=mn,
             max_price=mx,
             limit=limit,
             relevance_threshold=rel_th,
@@ -709,6 +744,55 @@ async def fetch_completed_items_with_diagnostics(
         if diag.get("failure_reason") in {"http_error", "rate_limited"}:
             break
 
+    # ── SerpAPI augmentation ───────────────────────────────────────────────
+    # When eBay Finding came up short (rate limited, low relevance, or just
+    # empty) ask SerpAPI for sold comparables under the same query. Rows are
+    # merged + deduped so downstream FMV sees a combined, richer set.
+    try:
+        from app.serpapi_ebay import fetch_sold_comps_serpapi, is_serpapi_configured
+        if is_serpapi_configured() and len(best_rows) < min_comps_threshold:
+            serp_rows, serp_diag = await fetch_sold_comps_serpapi(
+                keywords=keywords,
+                condition=condition,
+                min_price=min_price,
+                max_price=max_price,
+                limit=limit,
+                min_comps_threshold=max(1, min_comps_threshold - len(best_rows)),
+            )
+            stage_diags.append(serp_diag)
+            if serp_rows:
+                # Tag origins so downstream can report which sources contributed.
+                for row in best_rows:
+                    row.setdefault("source", "ebay_finding")
+                combined: List[Dict[str, Any]] = list(best_rows)
+                seen_keys = {
+                    (str(r.get("title", "")).lower(), int(r.get("sold_price_cents") or 0))
+                    for r in combined
+                }
+                for row in serp_rows:
+                    key = (str(row.get("title", "")).lower(), int(row.get("sold_price_cents") or 0))
+                    if key not in seen_keys:
+                        combined.append(row)
+                        seen_keys.add(key)
+                if len(combined) > len(best_rows):
+                    logger.info(
+                        "serpapi_augment: keywords=%r finding=%d serpapi=%d combined=%d",
+                        keywords[:80], len(best_rows), len(serp_rows), len(combined),
+                    )
+                    best_rows = combined
+                    # Preserve the most informative diag: keep Finding stage info
+                    # as `primary_diag` but surface combined sources.
+                    if best_diag is not None:
+                        best_diag["augmented_with_serpapi"] = True
+                        existing_sources = best_diag.get("sources") or []
+                        best_diag["sources"] = sorted(
+                            set(existing_sources) | {"ebay_finding", "serpapi"}
+                        )
+                    else:
+                        best_diag = serp_diag
+    except Exception as exc:
+        logger.warning("serpapi_augment_error: %s", exc)
+
     if best_diag is None:
         best_diag = _build_comparable_diagnostics(
             stage="strict",
@@ -721,6 +805,9 @@ async def fetch_completed_items_with_diagnostics(
     best_diag["stages"] = stage_diags
     if best_diag.get("failure_reason") is None and not best_rows:
         best_diag["failure_reason"] = "no_comparables_after_fallback"
+    if best_rows and not best_diag.get("sources"):
+        # Single-source (Finding only) — still annotate for frontend clarity.
+        best_diag["sources"] = ["ebay_finding"]
     logger.info(
         "fetch_completed_items_fallback: keywords=%r best_stage=%s best_count=%d reason=%s",
         keywords[:80],
@@ -741,15 +828,252 @@ async def fetch_completed_items(
     condition: Optional[str] = None,
     max_price: Optional[float] = None,
     limit: int = 50,
+    min_price: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Backwards-compatible wrapper: returns rows only."""
     rows, _diag = await fetch_completed_items_with_diagnostics(
         keywords=keywords,
         condition=condition,
+        min_price=min_price,
         max_price=max_price,
         limit=limit,
     )
     return rows
+
+
+async def fetch_sold_comps_multi_source(
+    keywords: str,
+    condition: Optional[str] = None,
+    max_price: Optional[float] = None,
+    limit: int = 50,
+    *,
+    min_price: Optional[float] = None,
+    category_id: Optional[str] = None,
+    domain: Optional[str] = None,
+    min_comps_threshold: int = 5,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Combined sold-comparable retrieval.
+
+    Strategy:
+      1. Query the eBay Finding API (`fetch_completed_items_with_diagnostics`).
+      2. If the result count is below ``min_comps_threshold`` AND SerpAPI is
+         configured, query SerpAPI (engine=ebay, show_only=Sold) and merge
+         rows — deduped by (title, sold_price_cents, end_time) — so the
+         downstream FMV pipeline sees one unified comparable list.
+
+    Diagnostics are returned with an extra ``sources`` array describing which
+    backends contributed rows.
+    """
+    primary_rows, primary_diag = await fetch_completed_items_with_diagnostics(
+        keywords=keywords,
+        condition=condition,
+        min_price=min_price,
+        max_price=max_price,
+        limit=limit,
+        min_comps_threshold=min_comps_threshold,
+    )
+
+    merged_rows: List[Dict[str, Any]] = list(primary_rows)
+    sources: List[Dict[str, Any]] = [{
+        "source": "ebay_finding",
+        "stage": primary_diag.get("stage"),
+        "count": len(primary_rows),
+        "failure_reason": primary_diag.get("failure_reason"),
+    }]
+    augmentation_diag: Optional[Dict[str, Any]] = None
+
+    needs_augment = len(primary_rows) < min_comps_threshold
+    try:
+        from app.serpapi_ebay import fetch_sold_comps_serpapi, is_serpapi_configured
+    except Exception:  # pragma: no cover — import guard only
+        fetch_sold_comps_serpapi = None  # type: ignore[assignment]
+        is_serpapi_configured = lambda: False  # type: ignore[assignment]
+
+    if needs_augment and fetch_sold_comps_serpapi and is_serpapi_configured():
+        serp_rows, serp_diag = await fetch_sold_comps_serpapi(
+            keywords=keywords,
+            condition=condition,
+            min_price=min_price,
+            max_price=max_price,
+            limit=limit,
+            category_id=category_id,
+            domain=domain,
+            min_comps_threshold=min_comps_threshold,
+        )
+        augmentation_diag = serp_diag
+        sources.append({
+            "source": "serpapi",
+            "stage": serp_diag.get("stage"),
+            "count": len(serp_rows),
+            "failure_reason": serp_diag.get("failure_reason"),
+        })
+
+        if serp_rows:
+            # Dedupe: same title + same price + same end_time (to the day) is
+            # almost certainly the same completed listing scraped twice.
+            def _key(row: Dict[str, Any]) -> Tuple[str, int, str]:
+                t = str(row.get("title") or "").strip().lower()
+                p = int(row.get("sold_price_cents") or 0)
+                et = str(row.get("end_time") or "")[:10]
+                return (t, p, et)
+
+            seen: set = {_key(r) for r in merged_rows}
+            for r in serp_rows:
+                k = _key(r)
+                if k in seen:
+                    continue
+                seen.add(k)
+                merged_rows.append(r)
+
+    # Build merged diag. Keep the primary diag's failure_reason when we had
+    # *no* rows from anywhere; otherwise clear it since we now have data.
+    merged_diag: Dict[str, Any] = dict(primary_diag)
+    merged_diag["sources"] = sources
+    merged_diag["final_count"] = len(merged_rows)
+    if merged_rows:
+        merged_diag["failure_reason"] = None
+        if augmentation_diag and len(merged_rows) > len(primary_rows):
+            merged_diag["augmented_by"] = "serpapi"
+            merged_diag["augmentation_added"] = len(merged_rows) - len(primary_rows)
+
+    serpapi_count = int(augmentation_diag.get("final_count", 0)) if augmentation_diag else 0
+    logger.info(
+        "fetch_sold_comps_multi: primary=%d serpapi=%d merged=%d primary_reason=%s",
+        len(primary_rows),
+        serpapi_count,
+        len(merged_rows),
+        primary_diag.get("failure_reason"),
+    )
+    return merged_rows, merged_diag
+
+
+def compact_listing_title_for_ebay_comp_query(title: str, *, max_len: int = 100) -> str:
+    """Turn a catalog product name or live listing title into a compact eBay keyword string.
+
+    SerpAPI ``_nkw`` is short; drop bracketed bundles and trim aggressively.
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+    t = re.split(r"[|\[\]]", t, maxsplit=1)[0].strip()
+    t = " ".join(t.split())
+    if len(t) > max_len:
+        cut = t[:max_len]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        t = cut.strip()
+    return t[:120]
+
+
+def _sold_row_dedupe_key(row: Dict[str, Any]) -> Tuple[str, int, str]:
+    t = str(row.get("title") or "").strip().lower()
+    p = int(row.get("sold_price_cents") or 0)
+    et = str(row.get("end_time") or "")[:10]
+    return (t, p, et)
+
+
+async def augment_sold_rows_with_serpapi_title_hints(
+    *,
+    base_query: str,
+    title_hints: Sequence[str],
+    existing_rows: List[Dict[str, Any]],
+    condition: Optional[str],
+    min_price: Optional[float],
+    max_price: Optional[float],
+    category_id: Optional[str],
+    domain: Optional[str],
+    max_hints: int = 5,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Re-query SerpAPI sold listings using each title hint as ``keywords`` / ``_nkw``.
+
+    Used when the primary interview-style query returns too few sold comps but
+    we have richer strings (recommended product names or live listing titles).
+    """
+    diag: Dict[str, Any] = {
+        "title_hint_augmentation": True,
+        "base_query": (base_query or "")[:120],
+        "hints_used": [],
+        "rows_added": 0,
+    }
+    try:
+        from app.serpapi_ebay import fetch_sold_comps_serpapi, is_serpapi_configured
+    except Exception:
+        return list(existing_rows), {**diag, "skipped": "import_error"}
+
+    if not is_serpapi_configured() or not title_hints:
+        return list(existing_rows), {**diag, "skipped": "no_serpapi_or_hints"}
+
+    out: List[Dict[str, Any]] = list(existing_rows)
+    seen: set = {_sold_row_dedupe_key(r) for r in out}
+    bq = (base_query or "").strip().lower()
+    used = 0
+    for raw_hint in title_hints:
+        if used >= max_hints:
+            break
+        q = compact_listing_title_for_ebay_comp_query(str(raw_hint))
+        if not q or len(q) < 6:
+            continue
+        if q.strip().lower() == bq:
+            continue
+        used += 1
+        try:
+            rows, sdiag = await fetch_sold_comps_serpapi(
+                q,
+                condition=condition,
+                min_price=min_price,
+                max_price=max_price,
+                limit=40,
+                category_id=category_id,
+                domain=domain,
+                min_comps_threshold=1,
+            )
+            # Category 177 + tight price filters often yield zero organic sold rows
+            # even when a looser SerpAPI query would. Retry once without category
+            # and without price caps to maximize recall for FMV.
+            if not rows and (category_id or max_price is not None or min_price is not None):
+                rows_loose, sdiag_loose = await fetch_sold_comps_serpapi(
+                    q,
+                    condition=None,
+                    min_price=None,
+                    max_price=None,
+                    limit=40,
+                    category_id=None,
+                    domain=domain,
+                    min_comps_threshold=1,
+                )
+                if rows_loose:
+                    rows, sdiag = rows_loose, sdiag_loose
+                    sdiag["retried_loose"] = True
+        except Exception as exc:
+            logger.warning("serpapi_title_hint_error: hint=%r err=%s", q[:80], exc)
+            rows, sdiag = [], {"failure_reason": "exception"}
+
+        diag["hints_used"].append({
+            "query": q,
+            "count": len(rows),
+            "stage": sdiag.get("stage"),
+            "failure_reason": sdiag.get("failure_reason"),
+            "retried_loose": sdiag.get("retried_loose"),
+        })
+        for r in rows:
+            k = _sold_row_dedupe_key(r)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
+
+    diag["rows_added"] = len(out) - len(existing_rows)
+    diag["final_count"] = len(out)
+    logger.info(
+        "serpapi_title_hints: base=%r hint_calls=%d rows_in=%d rows_out=%d added=%d",
+        (base_query or "")[:60],
+        len(diag["hints_used"]),
+        len(existing_rows),
+        len(out),
+        diag["rows_added"],
+    )
+    return out, diag
 
 
 class BrowseSellerProfile:

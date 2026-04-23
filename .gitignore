@@ -121,3 +121,4 @@ secrets.yaml
 credentials.json
 
 .claude/
+/idss-web

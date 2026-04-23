@@ -102,6 +102,33 @@ def parse_comparables(raw_items: List[Dict[str, Any]]) -> List[SoldComparable]:
     return comps
 
 
+def narrow_comparables_to_price_band(
+    comparables: List[SoldComparable],
+    min_usd: Optional[float],
+    max_usd: Optional[float],
+    *,
+    keep_at_least: int = 3,
+    slack: float = 0.12,
+) -> List[SoldComparable]:
+    """Drop sold comps outside the shopper's budget band when enough comps remain.
+
+    Prevents FMV from being anchored by $200 clearance units when the user asked
+    for a $700–$1000 machine. If filtering would leave too few points, returns
+    the original list unchanged.
+    """
+    if not comparables or (min_usd is None and max_usd is None):
+        return comparables
+    lo_c = int(min_usd * (1.0 - slack) * 100.0) if min_usd is not None else None
+    hi_c = int(max_usd * (1.0 + slack) * 100.0) if max_usd is not None else None
+    filtered = [
+        c
+        for c in comparables
+        if (lo_c is None or c.sold_price_cents >= lo_c)
+        and (hi_c is None or c.sold_price_cents <= hi_c)
+    ]
+    return filtered if len(filtered) >= keep_at_least else comparables
+
+
 def iqr_filter(prices: np.ndarray) -> tuple[np.ndarray, float, float]:
     """Remove outliers using 1.5×IQR rule. Returns (filtered, q1, q3)."""
     if len(prices) < 4:

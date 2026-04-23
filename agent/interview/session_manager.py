@@ -32,6 +32,13 @@ class SessionResponse(BaseModel):
     session_intent: Optional[str] = None
     step_intent: Optional[str] = None
     conversation_length: int = 0
+    # Post-rec / commerce-flow diagnostics.  Exposed so front-end (and
+    # integration tests) can verify that a "Change budget" turn actually
+    # armed the pending_refine_slot and that the web-search mode is sticky
+    # between turns.  Unset unless the session has reached that state.
+    pending_refine_slot: Optional[str] = None
+    commerce_search_mode: Optional[str] = None
+    agent_filters: Dict[str, Any] = Field(default_factory=dict)
 
 class ResetRequest(BaseModel):
     session_id: str = Field(..., description="Session ID to reset")
@@ -95,6 +102,15 @@ class InterviewSessionState:
     # When the agent reaches recommendations_ready but the user hasn't picked a
     # source yet, we stash the handoff context so we can resume after their choice.
     pending_handoff: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
+    # Post-recommendation "which slot is the user about to change?" flag.
+    # Set when the user taps "Change budget" / "Different brand" / … so the NEXT
+    # message is interpreted as the value for that slot (e.g. "$800-$1500").
+    # Cleared after the slot is applied or the user says something else.
+    pending_refine_slot: Optional[str] = None
+    # Last filters sent to _handle_web_search_handoff.  Stashed so the "Try
+    # again" quick-reply (shown when eBay returns 0 listings) can re-run the
+    # SAME search without reconstructing filters from scratch.
+    last_web_search_filters: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
     # In-memory product cache keyed by product_id — NOT serialized to Redis.
     # Accumulates every product dict shown to the user this session so follow-up
     # questions ("tell me more about that first one") never need a DB round-trip.
@@ -148,6 +164,8 @@ class InterviewSessionManager:
             "agent_history": getattr(state, "agent_history", [])[-10:],
             "commerce_search_mode": getattr(state, "commerce_search_mode", None),
             "pending_handoff": getattr(state, "pending_handoff", None),
+            "pending_refine_slot": getattr(state, "pending_refine_slot", None),
+            "last_web_search_filters": getattr(state, "last_web_search_filters", None),
         }
 
     def _dict_to_state(self, d: Dict[str, Any]) -> InterviewSessionState:
@@ -171,6 +189,8 @@ class InterviewSessionManager:
             agent_history=d.get("agent_history", []),
             commerce_search_mode=d.get("commerce_search_mode"),
             pending_handoff=d.get("pending_handoff"),
+            pending_refine_slot=d.get("pending_refine_slot"),
+            last_web_search_filters=d.get("last_web_search_filters"),
         )
 
     def add_favorite(self, session_id: str, product_id: str) -> None:
@@ -588,6 +608,9 @@ def get_session_state(session_id: str) -> SessionResponse:
         session_intent=getattr(session, "session_intent", None),
         step_intent=getattr(session, "step_intent", None),
         conversation_length=len(session.conversation_history),
+        pending_refine_slot=getattr(session, "pending_refine_slot", None),
+        commerce_search_mode=getattr(session, "commerce_search_mode", None),
+        agent_filters=getattr(session, "agent_filters", {}) or {},
     )
 
 def reset_session(session_id: str) -> ResetResponse:

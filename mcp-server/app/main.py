@@ -477,6 +477,24 @@ def _format_response_as_text(response: ChatResponse) -> str:
                 badges.append(f"FMV: {fmv_src.replace('_', ' ')}")
             if badges:
                 lines.append(f"   {' · '.join(badges)}")
+
+            ph = item.get("price_history")
+            if isinstance(ph, dict) and ph.get("p50_cents"):
+                p10 = ph.get("p10_cents")
+                p50 = ph.get("p50_cents")
+                p90 = ph.get("p90_cents")
+                n = ph.get("count") or 0
+                window = ph.get("window_days") or 90
+                def _usd(c):
+                    try:
+                        return f"${int(c) / 100:,.0f}"
+                    except (TypeError, ValueError):
+                        return "—"
+                lines.append(
+                    f"   Recent sold ({n}, {window}d): "
+                    f"p10 {_usd(p10)} · median {_usd(p50)} · p90 {_usd(p90)}"
+                )
+
             url = item.get("url")
             if url:
                 lines.append(f"   {url}")
@@ -661,6 +679,7 @@ class EbayResult(BaseModel):
 
 class EbaySearchResponse(BaseModel):
     query: str
+    min_price: Optional[float] = None
     max_price: Optional[float] = None
     condition: Optional[str] = None  # effective filter after NL parse ("new"|"used"|"refurbished")
     results: List[EbayResult]
@@ -693,6 +712,10 @@ class EvaluatedListing(BaseModel):
     fmv_stage: Optional[str] = None
     fmv_fallback_reason: Optional[str] = None
     fmv_query_used: Optional[str] = None
+    # Historical pricing summary (p10/p50/p90, bucketed medians) built from
+    # sold comparables. `None` when there aren't enough points to render a
+    # meaningful chart. Schema: see app.price_history.build_price_history_summary
+    price_history: Optional[Dict[str, Any]] = None
 
 
 class EvaluatedSearchResponse(BaseModel):
@@ -810,10 +833,12 @@ def _ebay_finding_error_messages(data: Any) -> List[str]:
 @app.get("/search/ebay", response_model=EbaySearchResponse)
 async def search_ebay(
     q: str,
+    min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     condition: Optional[str] = None,   # "new" | "used" | "refurbished"
     sort: Optional[str] = "best-match",  # "price-low" | "best-match" | "ending-soon"
     limit: int = 5,
+    category_ids: Optional[str] = None,  # e.g. "177" for PC Laptops & Netbooks
 ):
     """
     Search eBay listings and return structured results.
@@ -831,8 +856,14 @@ async def search_ebay(
     import httpx as _httpx
     from urllib.parse import quote as _quote
 
-    _nl = parse_natural_ebay_query(q or "", explicit_max_price=max_price, explicit_condition=condition)
+    _nl = parse_natural_ebay_query(
+        q or "",
+        explicit_max_price=max_price,
+        explicit_condition=condition,
+        explicit_min_price=min_price,
+    )
     q = _nl.clean_query
+    min_price = _nl.min_price
     max_price = _nl.max_price
     condition = _nl.condition
 
@@ -842,10 +873,14 @@ async def search_ebay(
     condition_codes = {"new": "LH_New=1", "used": "LH_Used=1", "refurbished": "LH_Refurb=1"}
 
     url_params = [f"_nkw={_quote(q)}", f"_sop={sort_code}", "_ipg=25"]
+    if min_price:
+        url_params.append(f"_udlo={int(min_price)}")
     if max_price:
         url_params.append(f"_udhi={int(max_price)}")
     if condition and condition in condition_codes:
         url_params.append(condition_codes[condition])
+    if category_ids:
+        url_params.append(f"_sacat={_quote(str(category_ids))}")
 
     search_url = "https://www.ebay.com/sch/i.html?" + "&".join(url_params)
 
@@ -863,17 +898,29 @@ async def search_ebay(
                 "paginationInput.entriesPerPage": str(min(limit, 10)),
                 "sortOrder": "BestMatch" if sort == "best-match" else "PricePlusShippingLowest",
             }
-            if max_price:
-                api_params["itemFilter(0).name"] = "MaxPrice"
-                api_params["itemFilter(0).value"] = str(max_price)
-                api_params["itemFilter(0).paramName"] = "Currency"
-                api_params["itemFilter(0).paramValue"] = "USD"
+            _fi = 0
+            if min_price is not None:
+                api_params[f"itemFilter({_fi}).name"] = "MinPrice"
+                api_params[f"itemFilter({_fi}).value"] = str(min_price)
+                api_params[f"itemFilter({_fi}).paramName"] = "Currency"
+                api_params[f"itemFilter({_fi}).paramValue"] = "USD"
+                _fi += 1
+            if max_price is not None:
+                api_params[f"itemFilter({_fi}).name"] = "MaxPrice"
+                api_params[f"itemFilter({_fi}).value"] = str(max_price)
+                api_params[f"itemFilter({_fi}).paramName"] = "Currency"
+                api_params[f"itemFilter({_fi}).paramValue"] = "USD"
+                _fi += 1
             if condition == "new":
-                api_params["itemFilter(1).name"] = "Condition"
-                api_params["itemFilter(1).value"] = "1000"
+                api_params[f"itemFilter({_fi}).name"] = "Condition"
+                api_params[f"itemFilter({_fi}).value"] = "1000"
+                _fi += 1
             elif condition == "used":
-                api_params["itemFilter(1).name"] = "Condition"
-                api_params["itemFilter(1).value"] = "3000"
+                api_params[f"itemFilter({_fi}).name"] = "Condition"
+                api_params[f"itemFilter({_fi}).value"] = "3000"
+                _fi += 1
+            if category_ids:
+                api_params["categoryId"] = str(category_ids)
 
             _ebay_env = os.getenv("EBAY_ENVIRONMENT", "SANDBOX").upper()
             _finding_host = (
@@ -981,6 +1028,7 @@ async def search_ebay(
                 results = await _enrich_results_with_mre(results)
                 return EbaySearchResponse(
                     query=q,
+                    min_price=min_price,
                     max_price=max_price,
                     condition=condition,
                     results=results,
@@ -997,9 +1045,11 @@ async def search_ebay(
             browse_rows = await search_item_summaries(
                 q=q,
                 limit=limit,
+                min_price=min_price,
                 max_price=max_price,
                 condition=condition,
                 sort=sort,
+                category_ids=category_ids,
             )
             if browse_rows:
                 br_results: List[EbayResult] = []
@@ -1031,6 +1081,7 @@ async def search_ebay(
                 br_results = await _enrich_results_with_mre(br_results)
                 return EbaySearchResponse(
                     query=q,
+                    min_price=min_price,
                     max_price=max_price,
                     condition=condition,
                     results=br_results,
@@ -1093,6 +1144,7 @@ async def search_ebay(
             results = await _enrich_results_with_mre(results)
             return EbaySearchResponse(
                 query=q,
+                min_price=min_price,
                 max_price=max_price,
                 condition=condition,
                 results=results,
@@ -1120,6 +1172,7 @@ async def search_ebay(
     # OpenClaw's browser automation will open the URL and scrape the page itself.
     return EbaySearchResponse(
         query=q,
+        min_price=min_price,
         max_price=max_price,
         condition=condition,
         results=[],
@@ -1140,6 +1193,7 @@ def _ebay_result_to_evaluated(
     fmv_stage: Optional[str] = None,
     fmv_fallback_reason: Optional[str] = None,
     fmv_query_used: Optional[str] = None,
+    price_history: Optional[Dict[str, Any]] = None,
 ) -> EvaluatedListing:
     """Flatten an EbayResult + optional FMV/Decision/Comms into an EvaluatedListing."""
     return EvaluatedListing(
@@ -1165,53 +1219,206 @@ def _ebay_result_to_evaluated(
         fmv_stage=fmv_stage,
         fmv_fallback_reason=fmv_fallback_reason,
         fmv_query_used=fmv_query_used,
+        price_history=price_history,
     )
 
 
 async def _tool_search_and_evaluate_ebay(
     query: str,
     condition: Optional[str] = None,
+    min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     limit: int = 5,
+    category_ids: Optional[str] = None,
+    listing_title_hints: Optional[List[str]] = None,
+    domain: Optional[str] = None,
 ) -> EvaluatedSearchResponse:
     """
     MCP tool handler: search eBay and evaluate each listing against FMV.
 
     1. search_ebay() for live listings
-    2. fetch_completed_items() once for sold comparables
+    2. Sold comparables (eBay Finding + SerpAPI) use the same parsed keywords as
+       step 1 (`search_resp.query`). When comps stay thin, SerpAPI is retried
+       with compact strings derived from live listing titles (and optional
+       ``listing_title_hints``).
     3. compute_fmv() + decide() per listing
     4. Return EvaluatedSearchResponse
     """
-    from app.ebay_seller import fetch_completed_items_with_diagnostics
-    from app.market_analysis import compute_fmv, parse_comparables, SoldComparable
+    import os as _os
+
+    from app.ebay_seller import (
+        augment_sold_rows_with_serpapi_title_hints,
+        fetch_sold_comps_multi_source,
+        _sold_row_dedupe_key,
+    )
+    from app.market_analysis import (
+        compute_fmv,
+        narrow_comparables_to_price_band,
+        parse_comparables,
+        SoldComparable,
+    )
     from app.deal_engine import TargetListing, decide
+    from app.price_history import build_price_history_summary
 
     limit = max(1, min(int(limit), 20))
 
     search_resp = await search_ebay(
         q=query,
+        min_price=min_price,
         max_price=max_price,
         condition=condition,
         limit=limit,
+        category_ids=category_ids,
     )
 
+    _eff_min = search_resp.min_price
     _eff_max = search_resp.max_price
     _eff_cond = search_resp.condition
-    raw_comps, comp_diag = await fetch_completed_items_with_diagnostics(
+    _sold_max = (_eff_max * 2) if _eff_max else None
+    # Do not pass the shopper's price *floor* into sold-comp API queries: eBay
+    # sold prices for the same SKU are often below a $700–$1000 *listing* band,
+    # and SerpAPI/Finding MinPrice would return nothing → empty comps →
+    # active_market fallback.  We still tighten with narrow_comparables_to_price_band.
+    raw_comps, comp_diag = await fetch_sold_comps_multi_source(
         keywords=search_resp.query,
         condition=_eff_cond,
-        max_price=(_eff_max * 2) if _eff_max else None,
+        max_price=_sold_max,
         limit=50,
+        min_price=None,
+        category_id=category_ids,
+        domain=domain,
     )
     comparables = parse_comparables(raw_comps)
+    comparables = narrow_comparables_to_price_band(
+        comparables,
+        _eff_min,
+        _eff_max,
+    )
 
-    # When sold comparables are empty (e.g. rate-limited), build pseudo-
-    # comparables from the active search results so FMV reflects the real
-    # market snapshot rather than echoing each listing's own price.
+    _hint_min = int(_os.getenv("FMV_TITLE_HINT_MIN_COMPARABLES", "5"))
+    _hint_strings: List[str] = []
+    if listing_title_hints:
+        for h in listing_title_hints:
+            s = (h or "").strip()
+            if s:
+                _hint_strings.append(s)
+    for _r in search_resp.results:
+        _t = getattr(_r, "title", None) or ""
+        _t = str(_t).strip()
+        if _t:
+            _hint_strings.append(_t)
+    _seen_h: set = set()
+    _deduped_hints: List[str] = []
+    for h in _hint_strings:
+        low = h.lower()
+        if low in _seen_h:
+            continue
+        _seen_h.add(low)
+        _deduped_hints.append(h)
+
+    if len(comparables) < _hint_min and _deduped_hints:
+        raw_comps, title_hint_diag = await augment_sold_rows_with_serpapi_title_hints(
+            base_query=search_resp.query,
+            title_hints=_deduped_hints,
+            existing_rows=raw_comps,
+            condition=_eff_cond,
+            min_price=None,
+            max_price=_sold_max,
+            category_id=category_ids,
+            domain=domain,
+            max_hints=int(_os.getenv("FMV_TITLE_HINT_MAX_CALLS", "5")),
+        )
+        if isinstance(comp_diag, dict):
+            comp_diag["title_hint_diag"] = title_hint_diag
+        comparables = parse_comparables(raw_comps)
+        comparables = narrow_comparables_to_price_band(
+            comparables,
+            _eff_min,
+            _eff_max,
+        )
+
+    # Last resort: broad SerpAPI sold search on the same keywords with no
+    # category or price filters (cheap API shape; improves recall vs. 0 comps).
+    if not comparables:
+        try:
+            from app.serpapi_ebay import fetch_sold_comps_serpapi, is_serpapi_configured
+
+            if is_serpapi_configured() and (search_resp.query or "").strip():
+                emergency, emerg_diag = await fetch_sold_comps_serpapi(
+                    search_resp.query.strip(),
+                    condition=None,
+                    min_price=None,
+                    max_price=None,
+                    limit=50,
+                    category_id=None,
+                    domain=domain,
+                    min_comps_threshold=1,
+                )
+                if isinstance(comp_diag, dict):
+                    comp_diag["serpapi_emergency_loose"] = emerg_diag
+                if emergency:
+                    seen_k = {_sold_row_dedupe_key(r) for r in raw_comps}
+                    for r in emergency:
+                        k = _sold_row_dedupe_key(r)
+                        if k in seen_k:
+                            continue
+                        seen_k.add(k)
+                        raw_comps.append(r)
+                    comparables = parse_comparables(raw_comps)
+                    comparables = narrow_comparables_to_price_band(
+                        comparables,
+                        _eff_min,
+                        _eff_max,
+                    )
+        except Exception as exc:
+            logger.warning("serpapi_emergency_loose_error: %s", exc)
+
+    # Build a shared price-history summary (from sold comparables only — NOT
+    # active-market fallback, which would conflate listing prices with sold
+    # prices). Same payload is attached to every evaluated listing so the
+    # frontend can render the chart on any card in this result set.
+    price_history_payload: Optional[Dict[str, Any]] = None
+    if comparables:
+        try:
+            price_history_payload = build_price_history_summary(
+                comparables,
+                source="sold_history",
+                sources=comp_diag.get("sources") if isinstance(comp_diag, dict) else None,
+            )
+        except Exception as exc:
+            logger.warning("price_history_build_error: %s", exc)
+
     fmv_source = "sold_history"
     confidence_cap = 1.0
-    if not comparables:
+    _allow_active = _os.getenv("FMV_ALLOW_ACTIVE_MARKET_FALLBACK", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not comparables and _allow_active:
+        _diag_snip = None
+        if isinstance(comp_diag, dict):
+            _diag_snip = {
+                "failure_reason": comp_diag.get("failure_reason"),
+                "sources": comp_diag.get("sources"),
+                "title_hint": comp_diag.get("title_hint_diag"),
+                "emergency": comp_diag.get("serpapi_emergency_loose"),
+            }
+        try:
+            from app.serpapi_ebay import is_serpapi_configured as _sp_cfg
+            _serp_ok = _sp_cfg()
+        except Exception:
+            _serp_ok = False
+        logger.warning(
+            "fmv_active_market_fallback: query=%r raw_rows=%d serpapi_configured=%s diag=%s",
+            (search_resp.query or "")[:100],
+            len(raw_comps),
+            _serp_ok,
+            _diag_snip,
+        )
         from datetime import datetime, timezone
+
         priced_results = [r for r in search_resp.results if r.price_cents]
         if len(priced_results) >= 2:
             now = datetime.now(timezone.utc)
@@ -1237,7 +1444,13 @@ async def _tool_search_and_evaluate_ebay(
     evaluated: List[EvaluatedListing] = []
     for r in search_resp.results:
         if not r.price_cents:
-            evaluated.append(_ebay_result_to_evaluated(r))
+            evaluated.append(
+                _ebay_result_to_evaluated(
+                    r,
+                    fmv_query_used=search_resp.query,
+                    price_history=price_history_payload,
+                )
+            )
             continue
 
         try:
@@ -1270,7 +1483,9 @@ async def _tool_search_and_evaluate_ebay(
                     fmv_source=fmv_source,
                     fmv_stage=comp_diag.get("stage"),
                     fmv_fallback_reason=fallback_reason,
-                    fmv_query_used=comp_diag.get("query_used"),
+                    # Same string as live eBay Finding keywords + primary SerpAPI sold search.
+                    fmv_query_used=search_resp.query,
+                    price_history=price_history_payload,
                 )
             )
         except Exception as exc:
@@ -1281,7 +1496,8 @@ async def _tool_search_and_evaluate_ebay(
                     fmv_source=fmv_source,
                     fmv_stage=comp_diag.get("stage"),
                     fmv_fallback_reason=comp_diag.get("failure_reason"),
-                    fmv_query_used=comp_diag.get("query_used"),
+                    fmv_query_used=search_resp.query,
+                    price_history=price_history_payload,
                 )
             )
 
@@ -1408,13 +1624,27 @@ async def _tool_evaluate_single_listing(
             merchant_report=merchant_report_dict,
         )
 
-    raw_comps, comp_diag = await fetch_completed_items_with_diagnostics(
+    from app.ebay_seller import fetch_sold_comps_multi_source
+    from app.price_history import build_price_history_summary
+
+    raw_comps, comp_diag = await fetch_sold_comps_multi_source(
         keywords=title,
         condition=item_condition,
         max_price=(price_cents / 100.0) * 2.0,
         limit=50,
     )
     comparables = parse_comparables(raw_comps)
+
+    price_history_payload: Optional[Dict[str, Any]] = None
+    if comparables:
+        try:
+            price_history_payload = build_price_history_summary(
+                comparables,
+                source="sold_history",
+                sources=comp_diag.get("sources") if isinstance(comp_diag, dict) else None,
+            )
+        except Exception as exc:
+            logger.warning("price_history_build_error: %s", exc)
 
     fmv_result = await compute_fmv(
         target_price_cents=price_cents,
@@ -1464,6 +1694,7 @@ async def _tool_evaluate_single_listing(
         fmv_stage=comp_diag.get("stage"),
         fmv_fallback_reason=fallback_reason,
         fmv_query_used=comp_diag.get("query_used"),
+        price_history=price_history_payload,
     )
 
 

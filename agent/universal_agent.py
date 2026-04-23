@@ -443,14 +443,33 @@ class UniversalAgent:
                 continue
 
             if slot_name == "budget":
-                # Parse budget string into price filters
+                # Parse budget string into price filters.  We accept any
+                # natural phrasing the chat layer may have stashed on this
+                # slot: "$800-$1500", "between 800 and 1500", "keep it above
+                # $500", "no more than 1200 please", etc.
                 budget_str = str(value).replace("$", "").replace(",", "").replace(" ", "")
                 # Handle "k" suffix for vehicles (e.g. "20k-35k", "under 30k")
                 budget_str = re.sub(r'(\d+)k', lambda m: str(int(m.group(1)) * 1000), budget_str, flags=re.IGNORECASE)
+                budget_str_lc = budget_str.lower()
 
-                range_match = re.match(r"(\d+)-(\d+)", budget_str)
-                under_match = re.search(r"under(\d+)", budget_str.lower())
-                over_match = re.search(r"over(\d+)", budget_str.lower())
+                # Range separators after whitespace stripping: '-', 'to',
+                # 'and', en-dash (\u2013), em-dash (\u2014).  `re.search` (not
+                # match) so a lead-in like "keepitbetween800-1500" still
+                # matches on the "800-1500" portion.
+                range_match = re.search(
+                    r"(\d+)(?:-|\u2013|\u2014|to|and)(\d+)",
+                    budget_str_lc,
+                )
+                # Ceiling synonyms.
+                under_match = re.search(
+                    r"(?:under|below|lessthan|upto|atmost|nomorethan|max(?:imum)?|capat|capof|budget(?:of)?)(\d+)",
+                    budget_str_lc,
+                )
+                # Floor synonyms.
+                over_match = re.search(
+                    r"(?:over|above|morethan|atleast|startingat|min(?:imum)?|northof)(\d+)",
+                    budget_str_lc,
+                )
 
                 if domain == "vehicles":
                     if range_match:
@@ -467,11 +486,13 @@ class UniversalAgent:
                 else:
                     # E-commerce: use price_cents
                     if range_match:
-                        # Only set the ceiling for e-commerce ranges — "$1500-$2000" means
-                        # "up to $2000". A strict floor would exclude near-miss products
-                        # (e.g. Apple laptops at $1399 for a "$1500-$2000" budget).
-                        # The product store's quality floor already provides a soft lower bound.
-                        search_filters["price_max_cents"] = int(range_match.group(2)) * 100
+                        # Honour both ends of an explicit range ("$700-$1000"). Web search
+                        # and catalog SQL both need the floor so results are not dominated
+                        # by cheap SKUs that ignore the shopper's stated band.
+                        lo_d = int(range_match.group(1))
+                        hi_d = int(range_match.group(2))
+                        search_filters["price_min_cents"] = lo_d * 100
+                        search_filters["price_max_cents"] = hi_d * 100
                     elif under_match:
                         search_filters["price_max_cents"] = int(under_match.group(1)) * 100
                     elif over_match:

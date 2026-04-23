@@ -24,7 +24,14 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()
+
+# Load repo-root .env regardless of process cwd (otherwise SERPAPI_API_KEY,
+# EBAY_APP_ID, etc. are missing when uvicorn is started from another folder).
+_env_file = Path(_project_root) / ".env"
+if _env_file.is_file():
+    load_dotenv(_env_file)
+else:
+    load_dotenv()
 
 from idss.api.models import (
     ChatRequest,

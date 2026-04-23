@@ -17,6 +17,7 @@ class ParsedEbayQuery:
     """Result of parsing a natural-language eBay search string."""
 
     clean_query: str
+    min_price: Optional[float] = None
     max_price: Optional[float] = None
     condition: Optional[str] = None
 
@@ -87,17 +88,24 @@ def parse_natural_ebay_query(
     query: str,
     explicit_max_price: Optional[float] = None,
     explicit_condition: Optional[str] = None,
+    explicit_min_price: Optional[float] = None,
 ) -> ParsedEbayQuery:
     """
     Strip budget / condition phrases from *query* and return structured fields.
 
     - If explicit_max_price is set, it wins over any parsed ceiling.
+    - If explicit_min_price is set, it wins over any parsed floor.
     - If explicit_condition is set, it wins over parsed condition.
     - Multiple budget phrases: use the **minimum** (tightest ceiling).
     """
     original = (query or "").strip()
     if not original:
-        return ParsedEbayQuery(clean_query="", max_price=explicit_max_price, condition=explicit_condition)
+        return ParsedEbayQuery(
+            clean_query="",
+            min_price=explicit_min_price,
+            max_price=explicit_max_price,
+            condition=explicit_condition,
+        )
 
     text = original
     prices: List[float] = []
@@ -115,6 +123,7 @@ def parse_natural_ebay_query(
 
     parsed_max = min(prices) if prices else None
     max_price = explicit_max_price if explicit_max_price is not None else parsed_max
+    min_price = explicit_min_price
 
     parsed_cond: Optional[str] = None
     for cre, cond_val in _COND_STRIPS:
@@ -132,6 +141,7 @@ def parse_natural_ebay_query(
 
     return ParsedEbayQuery(
         clean_query=cleaned,
+        min_price=min_price,
         max_price=max_price,
         condition=condition,
     )
